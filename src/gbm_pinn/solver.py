@@ -68,7 +68,7 @@ class FiniteVolumeSolver:
         maximum_diffusivity = float(np.max(self.diffusivity, initial=0.0))
         dy, dx = self.spacing
         diffusion_rate = 2.0 * maximum_diffusivity * (1.0 / dx**2 + 1.0 / dy**2)
-        reaction_rate = self.parameters.proliferation_rate + maximum_treatment_rate
+        reaction_rate = self.parameters.maximum_reaction_slope + maximum_treatment_rate
         total_rate = diffusion_rate + reaction_rate
         return np.inf if total_rate == 0 else 0.9 / total_rate
 

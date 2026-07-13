@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from torch import Tensor, nn
+
+from gbm_pinn.equation import GrowthLaw
+
+
+def resolve_torch_device(requested: str) -> torch.device:
+    """Resolve an execution device and reject unavailable accelerators."""
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS was requested but is not available")
+    if requested != "cpu" and requested != "cuda" and requested != "mps":
+        raise ValueError("device must be 'auto', 'cpu', 'cuda', or 'mps'")
+    return torch.device(requested)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +40,8 @@ class PINNConfig:
     initial_diffusivity: float = 0.1
     initial_proliferation_rate: float = 0.1
     carrying_capacity: float = 1.0
+    growth_law: GrowthLaw = "logistic"
+    allee_parameter: float = 0.0
 
     def __post_init__(self) -> None:
         if self.hidden_width <= 0 or self.hidden_layers <= 0:
@@ -34,6 +56,12 @@ class PINNConfig:
         )
         if self.carrying_capacity <= 0:
             raise ValueError("carrying_capacity must be positive")
+        if self.growth_law not in ("logistic", "weak_allee"):
+            raise ValueError("growth_law must be 'logistic' or 'weak_allee'")
+        if self.allee_parameter < 0:
+            raise ValueError("allee_parameter must be nonnegative")
+        if self.growth_law == "logistic" and self.allee_parameter != 0:
+            raise ValueError("allee_parameter must be zero for logistic growth")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +74,14 @@ class TrainingConfig:
     data_weight: float = 1.0
     physics_weight: float = 1.0
     boundary_weight: float = 1.0
+    interface_weight: float = 1.0
     lbfgs_max_iterations: int = 0
     lbfgs_learning_rate: float = 1.0
+    data_batch_size: int | None = None
+    collocation_batch_size: int | None = None
+    boundary_batch_size: int | None = None
+    interface_batch_size: int | None = None
+    causal_time_chunks: int = 1
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -56,12 +90,30 @@ class TrainingConfig:
             raise ValueError("learning_rate must be positive")
         if self.parameter_learning_rate is not None and self.parameter_learning_rate <= 0:
             raise ValueError("parameter_learning_rate must be positive")
-        if min(self.data_weight, self.physics_weight, self.boundary_weight) < 0:
+        if (
+            min(
+                self.data_weight,
+                self.physics_weight,
+                self.boundary_weight,
+                self.interface_weight,
+            )
+            < 0
+        ):
             raise ValueError("loss weights must be nonnegative")
         if self.lbfgs_max_iterations < 0:
             raise ValueError("lbfgs_max_iterations must be nonnegative")
         if self.lbfgs_learning_rate <= 0:
             raise ValueError("lbfgs_learning_rate must be positive")
+        for name, value in (
+            ("data_batch_size", self.data_batch_size),
+            ("collocation_batch_size", self.collocation_batch_size),
+            ("boundary_batch_size", self.boundary_batch_size),
+            ("interface_batch_size", self.interface_batch_size),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive when provided")
+        if self.causal_time_chunks <= 0:
+            raise ValueError("causal_time_chunks must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +124,7 @@ class TrainingResult:
     data_loss: tuple[float, ...]
     physics_loss: tuple[float, ...]
     boundary_loss: tuple[float, ...]
+    interface_loss: tuple[float, ...]
 
 
 class TumorPINN(nn.Module):
@@ -82,6 +135,8 @@ class TumorPINN(nn.Module):
         coordinate_lower_bounds: Tensor,
         coordinate_upper_bounds: Tensor,
         config: PINNConfig | None = None,
+        *,
+        additional_input_width: int = 0,
     ) -> None:
         super().__init__()
         config = config or PINNConfig()
@@ -93,18 +148,14 @@ class TumorPINN(nn.Module):
             raise ValueError("coordinate bounds must be finite")
         if torch.any(lower >= upper):
             raise ValueError("lower coordinate bounds must be below upper bounds")
+        if additional_input_width < 0:
+            raise ValueError("additional_input_width must be nonnegative")
 
         self.config = config
         self.register_buffer("coordinate_lower_bounds", lower)
         self.register_buffer("coordinate_upper_bounds", upper)
 
-        layers: list[nn.Module] = []
-        input_width = 3
-        for _ in range(config.hidden_layers):
-            layers.extend((nn.Linear(input_width, config.hidden_width), nn.Tanh()))
-            input_width = config.hidden_width
-        layers.append(nn.Linear(input_width, 1))
-        self.network = nn.Sequential(*layers)
+        self.network = self._make_network(3 + additional_input_width)
 
         self.raw_diffusivity = nn.Parameter(
             torch.tensor(
@@ -122,6 +173,19 @@ class TumorPINN(nn.Module):
         )
         self.reset_parameters()
 
+    def _make_network(self, input_width: int) -> nn.Sequential:
+        """Build a density network for the requested feature width."""
+        layers: list[nn.Module] = []
+        for _ in range(self.config.hidden_layers):
+            layers.extend((nn.Linear(input_width, self.config.hidden_width), nn.Tanh()))
+            input_width = self.config.hidden_width
+        layers.append(nn.Linear(input_width, 1))
+        return nn.Sequential(*layers)
+
+    def field_parameters(self) -> Iterator[nn.Parameter]:
+        """Return trainable neural-field parameters without physical coefficients."""
+        return self.network.parameters()
+
     @property
     def diffusivity(self) -> Tensor:
         """Return diffusivity constrained to its configured interval."""
@@ -131,6 +195,14 @@ class TumorPINN(nn.Module):
     def proliferation_rate(self) -> Tensor:
         """Return proliferation constrained to its configured interval."""
         return _bounded_transform(self.raw_proliferation_rate, self.config.proliferation_bounds)
+
+    def diffusivity_at(self, coordinates: Tensor) -> Tensor:
+        """Return diffusivity at each space-time coordinate."""
+        return self.diffusivity.expand(coordinates.shape[0], 1)
+
+    def diffusivity_gradient_at(self, coordinates: Tensor) -> Tensor:
+        """Return spatial diffusivity gradients with columns x and y."""
+        return torch.zeros((coordinates.shape[0], 2), device=coordinates.device)
 
     def reset_parameters(self) -> None:
         """Initialize linear layers with tanh-compatible Xavier weights."""
@@ -143,6 +215,12 @@ class TumorPINN(nn.Module):
         """Predict density for physical coordinates with columns x, y, and t."""
         if coordinates.ndim != 2 or coordinates.shape[1] != 3:
             raise ValueError("coordinates must have shape (sample, 3)")
+        return self.config.carrying_capacity * torch.sigmoid(
+            self.network(self.coordinate_features(coordinates))
+        )
+
+    def coordinate_features(self, coordinates: Tensor) -> Tensor:
+        """Return normalized network features for physical coordinates."""
         normalized = (
             2.0
             * (
@@ -151,7 +229,7 @@ class TumorPINN(nn.Module):
             )
             - 1.0
         )
-        return self.config.carrying_capacity * torch.sigmoid(self.network(normalized))
+        return normalized
 
 
 def pde_residual(model: nn.Module, coordinates: Tensor) -> Tensor:
@@ -179,11 +257,24 @@ def pde_residual(model: nn.Module, coordinates: Tensor) -> Tensor:
         grad_outputs=torch.ones_like(density_y),
         create_graph=True,
     )[0][:, 1:2]
-    return (
-        density_t
-        - model.diffusivity * (density_xx + density_yy)
-        - model.proliferation_rate * density * (1.0 - density / model.config.carrying_capacity)
+    diffusivity = model.diffusivity_at(coordinates)
+    diffusivity_gradient = model.diffusivity_gradient_at(coordinates)
+    diffusion_divergence = (
+        diffusivity * (density_xx + density_yy)
+        + diffusivity_gradient[:, 0:1] * density_x
+        + diffusivity_gradient[:, 1:2] * density_y
     )
+    normalized_density = density / model.config.carrying_capacity
+    if model.config.growth_law == "logistic":
+        proliferation = model.proliferation_rate * density * (1.0 - normalized_density)
+    else:
+        proliferation = (
+            model.proliferation_rate
+            * density
+            * (normalized_density + model.config.allee_parameter)
+            * (1.0 - normalized_density)
+        )
+    return density_t - diffusion_divergence - proliferation
 
 
 def normal_flux(model: nn.Module, coordinates: Tensor, normals: Tensor) -> Tensor:
@@ -200,7 +291,7 @@ def normal_flux(model: nn.Module, coordinates: Tensor, normals: Tensor) -> Tenso
         grad_outputs=torch.ones_like(density),
         create_graph=True,
     )[0][:, :2]
-    return model.diffusivity * torch.sum(gradient * normals, dim=1, keepdim=True)
+    return model.diffusivity_at(coordinates) * torch.sum(gradient * normals, dim=1, keepdim=True)
 
 
 def fit_pinn(
@@ -211,6 +302,8 @@ def fit_pinn(
     *,
     boundary_coordinates: Tensor | None = None,
     boundary_normals: Tensor | None = None,
+    interface_coordinates: Tensor | None = None,
+    interface_normals: Tensor | None = None,
     config: TrainingConfig | None = None,
     learn_diffusivity: bool = True,
     learn_proliferation_rate: bool = True,
@@ -223,12 +316,16 @@ def fit_pinn(
         raise ValueError("data coordinates and density must contain equal samples")
     if (boundary_coordinates is None) != (boundary_normals is None):
         raise ValueError("boundary coordinates and normals must be provided together")
+    if (interface_coordinates is None) != (interface_normals is None):
+        raise ValueError("interface coordinates and normals must be provided together")
+    if interface_coordinates is not None and not hasattr(model, "interface_residual"):
+        raise ValueError("model must define interface_residual for interface training")
 
     model.raw_diffusivity.requires_grad_(learn_diffusivity)
     model.raw_proliferation_rate.requires_grad_(learn_proliferation_rate)
     parameter_learning_rate = config.parameter_learning_rate or config.learning_rate
     parameter_groups: list[dict[str, object]] = [
-        {"params": model.network.parameters(), "lr": config.learning_rate}
+        {"params": model.field_parameters(), "lr": config.learning_rate}
     ]
     physical_parameters = [
         parameter
@@ -245,37 +342,105 @@ def fit_pinn(
     data_history: list[float] = []
     physics_history: list[float] = []
     boundary_history: list[float] = []
+    interface_history: list[float] = []
 
-    def loss_terms() -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        data_loss = torch.mean((model(data_coordinates) - data_density) ** 2)
-        physics_loss = torch.mean(pde_residual(model, collocation_coordinates) ** 2)
+    def loss_terms(
+        *, use_batches: bool, time_upper_bound: float | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        available_data_coordinates, available_data_density = _paired_time_prefix(
+            data_coordinates,
+            data_density,
+            time_upper_bound,
+        )
+        selected_data_coordinates, selected_data_density = _paired_batch(
+            available_data_coordinates,
+            available_data_density,
+            config.data_batch_size if use_batches else None,
+        )
+        available_collocation = _single_time_prefix(
+            collocation_coordinates,
+            time_upper_bound,
+        )
+        selected_collocation = _single_batch(
+            available_collocation,
+            config.collocation_batch_size if use_batches else None,
+        )
+        data_loss = torch.mean((model(selected_data_coordinates) - selected_data_density) ** 2)
+        physics_loss = torch.mean(pde_residual(model, selected_collocation) ** 2)
         if boundary_coordinates is None:
             boundary_loss = torch.zeros((), device=data_coordinates.device)
         else:
-            boundary_loss = torch.mean(
-                normal_flux(model, boundary_coordinates, boundary_normals) ** 2
+            available_boundary_coordinates, available_boundary_normals = _paired_time_prefix(
+                boundary_coordinates,
+                boundary_normals,
+                time_upper_bound,
             )
+            selected_boundary_coordinates, selected_boundary_normals = _paired_batch(
+                available_boundary_coordinates,
+                available_boundary_normals,
+                config.boundary_batch_size if use_batches else None,
+            )
+            boundary_loss = torch.mean(
+                normal_flux(model, selected_boundary_coordinates, selected_boundary_normals) ** 2
+            )
+        if interface_coordinates is None:
+            interface_loss = torch.zeros((), device=data_coordinates.device)
+        else:
+            available_interface_coordinates, available_interface_normals = _paired_time_prefix(
+                interface_coordinates,
+                interface_normals,
+                time_upper_bound,
+            )
+            selected_interface_coordinates, selected_interface_normals = _paired_batch(
+                available_interface_coordinates,
+                available_interface_normals,
+                config.interface_batch_size if use_batches else None,
+            )
+            density_jump, flux_jump = model.interface_residual(
+                selected_interface_coordinates, selected_interface_normals
+            )
+            interface_loss = torch.mean(density_jump**2) + torch.mean(flux_jump**2)
         total_loss = (
             config.data_weight * data_loss
             + config.physics_weight * physics_loss
             + config.boundary_weight * boundary_loss
+            + config.interface_weight * interface_loss
         )
-        return total_loss, data_loss, physics_loss, boundary_loss
+        return total_loss, data_loss, physics_loss, boundary_loss, interface_loss
 
     def record_losses(
-        total_loss: Tensor, data_loss: Tensor, physics_loss: Tensor, boundary_loss: Tensor
+        total_loss: Tensor,
+        data_loss: Tensor,
+        physics_loss: Tensor,
+        boundary_loss: Tensor,
+        interface_loss: Tensor,
     ) -> None:
         total_history.append(float(total_loss.detach()))
         data_history.append(float(data_loss.detach()))
         physics_history.append(float(physics_loss.detach()))
         boundary_history.append(float(boundary_loss.detach()))
+        interface_history.append(float(interface_loss.detach()))
 
-    for _ in range(config.epochs):
+    time_lower = float(model.coordinate_lower_bounds[2].detach().cpu())
+    time_upper = float(model.coordinate_upper_bounds[2].detach().cpu())
+    for epoch in range(config.epochs):
+        current_time_upper: float | None = None
+        if config.causal_time_chunks > 1:
+            chunk = min(
+                config.causal_time_chunks - 1,
+                epoch * config.causal_time_chunks // config.epochs,
+            )
+            current_time_upper = time_lower + (time_upper - time_lower) * (
+                (chunk + 1) / config.causal_time_chunks
+            )
         optimizer.zero_grad(set_to_none=True)
-        total_loss, data_loss, physics_loss, boundary_loss = loss_terms()
+        total_loss, data_loss, physics_loss, boundary_loss, interface_loss = loss_terms(
+            use_batches=True,
+            time_upper_bound=current_time_upper,
+        )
         total_loss.backward()
         optimizer.step()
-        record_losses(total_loss, data_loss, physics_loss, boundary_loss)
+        record_losses(total_loss, data_loss, physics_loss, boundary_loss, interface_loss)
 
     if config.lbfgs_max_iterations > 0:
         trainable_parameters = [
@@ -290,9 +455,11 @@ def fit_pinn(
 
         def closure() -> Tensor:
             lbfgs.zero_grad(set_to_none=True)
-            total_loss, data_loss, physics_loss, boundary_loss = loss_terms()
+            total_loss, data_loss, physics_loss, boundary_loss, interface_loss = loss_terms(
+                use_batches=False,
+            )
             total_loss.backward()
-            record_losses(total_loss, data_loss, physics_loss, boundary_loss)
+            record_losses(total_loss, data_loss, physics_loss, boundary_loss, interface_loss)
             return total_loss
 
         lbfgs.step(closure)
@@ -302,7 +469,48 @@ def fit_pinn(
         data_loss=tuple(data_history),
         physics_loss=tuple(physics_history),
         boundary_loss=tuple(boundary_history),
+        interface_loss=tuple(interface_history),
     )
+
+
+def _single_batch(values: Tensor, batch_size: int | None) -> Tensor:
+    if batch_size is None or batch_size >= values.shape[0]:
+        return values
+    indices = torch.randperm(values.shape[0], device=values.device)[:batch_size]
+    return values[indices]
+
+
+def _paired_batch(left: Tensor, right: Tensor, batch_size: int | None) -> tuple[Tensor, Tensor]:
+    if left.shape[0] != right.shape[0]:
+        raise ValueError("paired batch tensors must contain equal samples")
+    if batch_size is None or batch_size >= left.shape[0]:
+        return left, right
+    indices = torch.randperm(left.shape[0], device=left.device)[:batch_size]
+    return left[indices], right[indices]
+
+
+def _single_time_prefix(values: Tensor, time_upper_bound: float | None) -> Tensor:
+    if time_upper_bound is None:
+        return values
+    selected = values[:, 2] <= time_upper_bound + 1e-7
+    if not torch.any(selected):
+        raise ValueError("causal time window contains no samples")
+    return values[selected]
+
+
+def _paired_time_prefix(
+    coordinates: Tensor,
+    values: Tensor,
+    time_upper_bound: float | None,
+) -> tuple[Tensor, Tensor]:
+    if coordinates.shape[0] != values.shape[0]:
+        raise ValueError("paired time-prefix tensors must contain equal samples")
+    if time_upper_bound is None:
+        return coordinates, values
+    selected = coordinates[:, 2] <= time_upper_bound + 1e-7
+    if not torch.any(selected):
+        raise ValueError("causal time window contains no samples")
+    return coordinates[selected], values[selected]
 
 
 def _validate_bounded_initial_value(value: float, bounds: tuple[float, float], name: str) -> None:

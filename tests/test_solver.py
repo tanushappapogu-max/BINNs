@@ -51,6 +51,26 @@ def test_uniform_logistic_growth_matches_analytical_solution() -> None:
     np.testing.assert_allclose(result.density[:, 0, 0], expected, rtol=2e-5, atol=2e-6)
 
 
+def test_weak_allee_growth_is_slower_than_logistic_growth_at_low_density() -> None:
+    shape = (24, 24)
+    density = np.full(shape, 0.05)
+    logistic = make_solver(diffusivity=0.0, proliferation_rate=0.08)
+    weak_allee = FiniteVolumeSolver(
+        diffusivity=np.zeros(shape),
+        brain_mask=np.ones(shape, dtype=bool),
+        parameters=ReactionDiffusionParameters(
+            proliferation_rate=0.08,
+            growth_law="weak_allee",
+            allee_parameter=0.05,
+        ),
+    )
+
+    logistic_result = logistic.simulate(density, np.array([10.0]), maximum_time_step=0.01)
+    allee_result = weak_allee.simulate(density, np.array([10.0]), maximum_time_step=0.01)
+
+    assert np.all(allee_result.density[-1] < logistic_result.density[-1])
+
+
 def test_cavity_remains_empty() -> None:
     cavity = np.zeros((24, 24), dtype=bool)
     cavity[10:14, 10:14] = True
