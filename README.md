@@ -19,12 +19,13 @@ The current implementation operates on two-dimensional synthetic tumor fields. T
 
 The primary baseline is a tissue-aware logistic reaction-diffusion equation:
 
-$$
-\frac{\partial u}{\partial t}
+```math
+\frac{\partial u(\mathbf{x},t)}{\partial t}
 =
-\nabla\cdot\left(D(x)\nabla u\right)
-+\rho u(1-u).
-$$
+\nabla \cdot \left[D(\mathbf{x})\nabla u(\mathbf{x},t)\right]
++
+\rho\,u(\mathbf{x},t)\left[1-u(\mathbf{x},t)\right]
+```
 
 In this equation:
 
@@ -38,12 +39,15 @@ The diffusion field can vary across tissue. White matter and gray matter can the
 
 The code also supports a weak-Allee growth law:
 
-$$
-\frac{\partial u}{\partial t}
+```math
+\frac{\partial u(\mathbf{x},t)}{\partial t}
 =
-\nabla\cdot\left(D(x)\nabla u\right)
-+\rho u(u+\beta)(1-u),
-$$
+\nabla \cdot \left[D(\mathbf{x})\nabla u(\mathbf{x},t)\right]
++
+\rho\,u(\mathbf{x},t)
+\left[u(\mathbf{x},t)+\beta\right]
+\left[1-u(\mathbf{x},t)\right]
+```
 
 where $\beta$ controls low-density growth behavior. This form is useful for studying sparse residual tumor cells after surgery.
 
@@ -53,9 +57,12 @@ The resection cavity is treated as an excluded internal region. Tumor density is
 
 The cavity boundary uses the zero-flux condition
 
-$$
-\mathbf n\cdot D\nabla u=0,
-$$
+```math
+\left.
+\mathbf{n}\cdot\left[D(\mathbf{x})\nabla u(\mathbf{x},t)\right]
+\right|_{\partial\Omega_{\mathrm{cavity}}}
+=0
+```
 
 where $\mathbf n$ is the boundary normal.
 
