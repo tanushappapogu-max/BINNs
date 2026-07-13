@@ -40,6 +40,40 @@ def test_output_and_parameters_stay_in_physical_ranges() -> None:
     assert 0.01 < float(model.proliferation_rate.detach()) < 0.2
 
 
+def test_three_dimensional_model_and_residual_are_finite() -> None:
+    model = TumorPINN(
+        coordinate_lower_bounds=torch.zeros(4),
+        coordinate_upper_bounds=torch.ones(4),
+        config=PINNConfig(hidden_width=8, hidden_layers=2),
+    )
+    coordinates = torch.rand(10, 4)
+
+    density = model(coordinates)
+    residual = pde_residual(model, coordinates)
+
+    assert density.shape == (10, 1)
+    assert residual.shape == (10, 1)
+    assert torch.all(torch.isfinite(residual))
+
+
+def test_fourier_features_expand_only_spatial_coordinates() -> None:
+    model = TumorPINN(
+        coordinate_lower_bounds=torch.zeros(4),
+        coordinate_upper_bounds=torch.ones(4),
+        config=PINNConfig(
+            hidden_width=8,
+            hidden_layers=2,
+            fourier_frequencies=(1.0, 2.0),
+        ),
+    )
+    coordinates = torch.rand(5, 4)
+
+    features = model.coordinate_features(coordinates)
+
+    assert features.shape == (5, 16)
+    assert model(coordinates).shape == (5, 1)
+
+
 class AnalyticSolution(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -243,3 +277,38 @@ def test_device_resolution_uses_cpu_when_requested() -> None:
 def test_device_resolution_rejects_unknown_device() -> None:
     with pytest.raises(ValueError, match="device"):
         resolve_torch_device("unknown")
+
+
+def test_training_checkpoint_can_resume(tmp_path) -> None:
+    torch.manual_seed(21)
+    coordinates = torch.rand(16, 3)
+    coordinates[:, 2] *= 2.0
+    density = torch.full((16, 1), 0.2)
+    checkpoint_path = tmp_path / "training.pt"
+
+    first_model = make_model()
+    first = fit_pinn(
+        first_model,
+        coordinates,
+        density,
+        coordinates,
+        config=TrainingConfig(epochs=2, checkpoint_interval=1),
+        checkpoint_path=checkpoint_path,
+    )
+    resumed_model = make_model()
+    resumed = fit_pinn(
+        resumed_model,
+        coordinates,
+        density,
+        coordinates,
+        config=TrainingConfig(epochs=4, checkpoint_interval=1),
+        checkpoint_path=checkpoint_path,
+        resume_from_checkpoint=True,
+    )
+
+    assert checkpoint_path.exists()
+    assert len(first.total_loss) == 2
+    assert len(resumed.total_loss) == 4
+    assert resumed.total_loss[:2] == first.total_loss
+    for expected, actual in zip(first_model.parameters(), resumed_model.parameters(), strict=True):
+        assert expected.shape == actual.shape

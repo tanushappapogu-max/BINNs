@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -42,6 +43,7 @@ class PINNConfig:
     carrying_capacity: float = 1.0
     growth_law: GrowthLaw = "logistic"
     allee_parameter: float = 0.0
+    fourier_frequencies: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.hidden_width <= 0 or self.hidden_layers <= 0:
@@ -62,6 +64,8 @@ class PINNConfig:
             raise ValueError("allee_parameter must be nonnegative")
         if self.growth_law == "logistic" and self.allee_parameter != 0:
             raise ValueError("allee_parameter must be zero for logistic growth")
+        if any(not np.isfinite(value) or value <= 0 for value in self.fourier_frequencies):
+            raise ValueError("fourier frequencies must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +86,7 @@ class TrainingConfig:
     boundary_batch_size: int | None = None
     interface_batch_size: int | None = None
     causal_time_chunks: int = 1
+    checkpoint_interval: int | None = None
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -114,6 +119,8 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be positive when provided")
         if self.causal_time_chunks <= 0:
             raise ValueError("causal_time_chunks must be positive")
+        if self.checkpoint_interval is not None and self.checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be positive when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,8 +149,8 @@ class TumorPINN(nn.Module):
         config = config or PINNConfig()
         lower = torch.as_tensor(coordinate_lower_bounds, dtype=torch.float32)
         upper = torch.as_tensor(coordinate_upper_bounds, dtype=torch.float32)
-        if lower.shape != (3,) or upper.shape != (3,):
-            raise ValueError("coordinate bounds must contain x, y, and t")
+        if lower.ndim != 1 or upper.shape != lower.shape or lower.numel() < 2:
+            raise ValueError("coordinate bounds must contain spatial dimensions followed by time")
         if not torch.all(torch.isfinite(lower)) or not torch.all(torch.isfinite(upper)):
             raise ValueError("coordinate bounds must be finite")
         if torch.any(lower >= upper):
@@ -152,10 +159,16 @@ class TumorPINN(nn.Module):
             raise ValueError("additional_input_width must be nonnegative")
 
         self.config = config
+        self.spatial_dimensions = lower.numel() - 1
         self.register_buffer("coordinate_lower_bounds", lower)
         self.register_buffer("coordinate_upper_bounds", upper)
 
-        self.network = self._make_network(3 + additional_input_width)
+        feature_width = (
+            lower.numel()
+            + 2 * self.spatial_dimensions * len(config.fourier_frequencies)
+            + additional_input_width
+        )
+        self.network = self._make_network(feature_width)
 
         self.raw_diffusivity = nn.Parameter(
             torch.tensor(
@@ -201,8 +214,14 @@ class TumorPINN(nn.Module):
         return self.diffusivity.expand(coordinates.shape[0], 1)
 
     def diffusivity_gradient_at(self, coordinates: Tensor) -> Tensor:
-        """Return spatial diffusivity gradients with columns x and y."""
-        return torch.zeros((coordinates.shape[0], 2), device=coordinates.device)
+        """Return one zero diffusivity-gradient column per spatial dimension."""
+        return torch.zeros(
+            (coordinates.shape[0], self.spatial_dimensions), device=coordinates.device
+        )
+
+    def treatment_rate_at(self, coordinates: Tensor) -> Tensor:
+        """Return treatment-mediated loss rate; untreated models use zero."""
+        return torch.zeros((coordinates.shape[0], 1), device=coordinates.device)
 
     def reset_parameters(self) -> None:
         """Initialize linear layers with tanh-compatible Xavier weights."""
@@ -212,9 +231,10 @@ class TumorPINN(nn.Module):
                 nn.init.zeros_(layer.bias)
 
     def forward(self, coordinates: Tensor) -> Tensor:
-        """Predict density for physical coordinates with columns x, y, and t."""
-        if coordinates.ndim != 2 or coordinates.shape[1] != 3:
-            raise ValueError("coordinates must have shape (sample, 3)")
+        """Predict density from spatial coordinates followed by time."""
+        expected_width = self.coordinate_lower_bounds.numel()
+        if coordinates.ndim != 2 or coordinates.shape[1] != expected_width:
+            raise ValueError(f"coordinates must have shape (sample, {expected_width})")
         return self.config.carrying_capacity * torch.sigmoid(
             self.network(self.coordinate_features(coordinates))
         )
@@ -229,7 +249,12 @@ class TumorPINN(nn.Module):
             )
             - 1.0
         )
-        return normalized
+        features = [normalized]
+        spatial = normalized[:, : self.spatial_dimensions]
+        for frequency in self.config.fourier_frequencies:
+            angle = torch.pi * frequency * spatial
+            features.extend((torch.sin(angle), torch.cos(angle)))
+        return torch.cat(features, dim=1)
 
 
 def pde_residual(model: nn.Module, coordinates: Tensor) -> Tensor:
@@ -242,27 +267,27 @@ def pde_residual(model: nn.Module, coordinates: Tensor) -> Tensor:
         grad_outputs=torch.ones_like(density),
         create_graph=True,
     )[0]
-    density_x = gradient[:, 0:1]
-    density_y = gradient[:, 1:2]
-    density_t = gradient[:, 2:3]
-    density_xx = torch.autograd.grad(
-        density_x,
-        coordinates,
-        grad_outputs=torch.ones_like(density_x),
-        create_graph=True,
-    )[0][:, 0:1]
-    density_yy = torch.autograd.grad(
-        density_y,
-        coordinates,
-        grad_outputs=torch.ones_like(density_y),
-        create_graph=True,
-    )[0][:, 1:2]
+    spatial_dimensions = getattr(model, "spatial_dimensions", coordinates.shape[1] - 1)
+    spatial_gradient = gradient[:, :spatial_dimensions]
+    density_t = gradient[:, -1:]
+    laplacian = torch.zeros_like(density)
+    for dimension in range(spatial_dimensions):
+        first_derivative = spatial_gradient[:, dimension : dimension + 1]
+        laplacian = (
+            laplacian
+            + torch.autograd.grad(
+                first_derivative,
+                coordinates,
+                grad_outputs=torch.ones_like(first_derivative),
+                create_graph=True,
+            )[0][:, dimension : dimension + 1]
+        )
     diffusivity = model.diffusivity_at(coordinates)
     diffusivity_gradient = model.diffusivity_gradient_at(coordinates)
-    diffusion_divergence = (
-        diffusivity * (density_xx + density_yy)
-        + diffusivity_gradient[:, 0:1] * density_x
-        + diffusivity_gradient[:, 1:2] * density_y
+    if diffusivity_gradient.shape != spatial_gradient.shape:
+        raise ValueError("diffusivity gradient must match the spatial coordinate dimensions")
+    diffusion_divergence = diffusivity * laplacian + torch.sum(
+        diffusivity_gradient * spatial_gradient, dim=1, keepdim=True
     )
     normalized_density = density / model.config.carrying_capacity
     if model.config.growth_law == "logistic":
@@ -274,13 +299,21 @@ def pde_residual(model: nn.Module, coordinates: Tensor) -> Tensor:
             * (normalized_density + model.config.allee_parameter)
             * (1.0 - normalized_density)
         )
-    return density_t - diffusion_divergence - proliferation
+    treatment_rate_function = getattr(model, "treatment_rate_at", None)
+    treatment_rate = (
+        treatment_rate_function(coordinates)
+        if treatment_rate_function is not None
+        else torch.zeros_like(density)
+    )
+    treatment_loss = treatment_rate * density
+    return density_t - diffusion_divergence - proliferation + treatment_loss
 
 
 def normal_flux(model: nn.Module, coordinates: Tensor, normals: Tensor) -> Tensor:
     """Return outward diffusive flux at boundary coordinates."""
-    if normals.ndim != 2 or normals.shape[1] != 2:
-        raise ValueError("normals must have shape (sample, 2)")
+    spatial_dimensions = getattr(model, "spatial_dimensions", coordinates.shape[1] - 1)
+    if normals.ndim != 2 or normals.shape[1] != spatial_dimensions:
+        raise ValueError(f"normals must have shape (sample, {spatial_dimensions})")
     if normals.shape[0] != coordinates.shape[0]:
         raise ValueError("normals and coordinates must contain the same number of samples")
     coordinates = coordinates.detach().clone().requires_grad_(True)
@@ -290,7 +323,7 @@ def normal_flux(model: nn.Module, coordinates: Tensor, normals: Tensor) -> Tenso
         coordinates,
         grad_outputs=torch.ones_like(density),
         create_graph=True,
-    )[0][:, :2]
+    )[0][:, :spatial_dimensions]
     return model.diffusivity_at(coordinates) * torch.sum(gradient * normals, dim=1, keepdim=True)
 
 
@@ -307,6 +340,9 @@ def fit_pinn(
     config: TrainingConfig | None = None,
     learn_diffusivity: bool = True,
     learn_proliferation_rate: bool = True,
+    learn_treatment_response: bool = True,
+    checkpoint_path: str | Path | None = None,
+    resume_from_checkpoint: bool = False,
 ) -> TrainingResult:
     """Fit network and physical parameters with Adam."""
     config = config or TrainingConfig()
@@ -323,6 +359,9 @@ def fit_pinn(
 
     model.raw_diffusivity.requires_grad_(learn_diffusivity)
     model.raw_proliferation_rate.requires_grad_(learn_proliferation_rate)
+    treatment_parameter = getattr(model, "raw_treatment_response", None)
+    if treatment_parameter is not None:
+        treatment_parameter.requires_grad_(learn_treatment_response)
     parameter_learning_rate = config.parameter_learning_rate or config.learning_rate
     parameter_groups: list[dict[str, object]] = [
         {"params": model.field_parameters(), "lr": config.learning_rate}
@@ -335,6 +374,8 @@ def fit_pinn(
         )
         if enabled
     ]
+    if treatment_parameter is not None and learn_treatment_response:
+        physical_parameters.append(treatment_parameter)
     if physical_parameters:
         parameter_groups.append({"params": physical_parameters, "lr": parameter_learning_rate})
     optimizer = torch.optim.Adam(parameter_groups)
@@ -343,6 +384,28 @@ def fit_pinn(
     physics_history: list[float] = []
     boundary_history: list[float] = []
     interface_history: list[float] = []
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    if resume_from_checkpoint and checkpoint_path is None:
+        raise ValueError("checkpoint_path is required when resume_from_checkpoint is true")
+    start_epoch = 0
+    if resume_from_checkpoint:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=data_coordinates.device,
+            weights_only=False,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = int(checkpoint["completed_epochs"])
+        if start_epoch > config.epochs:
+            raise ValueError("checkpoint has more completed epochs than requested training")
+        histories = checkpoint["histories"]
+        total_history.extend(histories["total_loss"])
+        data_history.extend(histories["data_loss"])
+        physics_history.extend(histories["physics_loss"])
+        boundary_history.extend(histories["boundary_loss"])
+        interface_history.extend(histories["interface_loss"])
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
 
     def loss_terms(
         *, use_batches: bool, time_upper_bound: float | None = None
@@ -423,7 +486,7 @@ def fit_pinn(
 
     time_lower = float(model.coordinate_lower_bounds[2].detach().cpu())
     time_upper = float(model.coordinate_upper_bounds[2].detach().cpu())
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         current_time_upper: float | None = None
         if config.causal_time_chunks > 1:
             chunk = min(
@@ -441,6 +504,25 @@ def fit_pinn(
         total_loss.backward()
         optimizer.step()
         record_losses(total_loss, data_loss, physics_loss, boundary_loss, interface_loss)
+        completed_epochs = epoch + 1
+        if checkpoint_path is not None and (
+            completed_epochs == config.epochs
+            or (
+                config.checkpoint_interval is not None
+                and completed_epochs % config.checkpoint_interval == 0
+            )
+        ):
+            _save_training_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                completed_epochs,
+                total_history,
+                data_history,
+                physics_history,
+                boundary_history,
+                interface_history,
+            )
 
     if config.lbfgs_max_iterations > 0:
         trainable_parameters = [
@@ -473,6 +555,40 @@ def fit_pinn(
     )
 
 
+def _save_training_checkpoint(
+    path: Path,
+    model: TumorPINN,
+    optimizer: torch.optim.Optimizer,
+    completed_epochs: int,
+    total_history: list[float],
+    data_history: list[float],
+    physics_history: list[float],
+    boundary_history: list[float],
+    interface_history: list[float],
+) -> None:
+    """Atomically persist enough state to resume Adam training."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "format_version": 1,
+            "completed_epochs": completed_epochs,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "histories": {
+                "total_loss": total_history,
+                "data_loss": data_history,
+                "physics_loss": physics_history,
+                "boundary_loss": boundary_history,
+                "interface_loss": interface_history,
+            },
+        },
+        temporary_path,
+    )
+    temporary_path.replace(path)
+
+
 def _single_batch(values: Tensor, batch_size: int | None) -> Tensor:
     if batch_size is None or batch_size >= values.shape[0]:
         return values
@@ -492,7 +608,7 @@ def _paired_batch(left: Tensor, right: Tensor, batch_size: int | None) -> tuple[
 def _single_time_prefix(values: Tensor, time_upper_bound: float | None) -> Tensor:
     if time_upper_bound is None:
         return values
-    selected = values[:, 2] <= time_upper_bound + 1e-7
+    selected = values[:, -1] <= time_upper_bound + 1e-7
     if not torch.any(selected):
         raise ValueError("causal time window contains no samples")
     return values[selected]
@@ -507,7 +623,7 @@ def _paired_time_prefix(
         raise ValueError("paired time-prefix tensors must contain equal samples")
     if time_upper_bound is None:
         return coordinates, values
-    selected = coordinates[:, 2] <= time_upper_bound + 1e-7
+    selected = coordinates[:, -1] <= time_upper_bound + 1e-7
     if not torch.any(selected):
         raise ValueError("causal time window contains no samples")
     return coordinates[selected], values[selected]

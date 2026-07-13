@@ -25,6 +25,8 @@ class TissueAwareTumorPINN(TumorPINN):
         white_to_gray_diffusivity_ratio: float,
         config: PINNConfig | None = None,
     ) -> None:
+        if torch.as_tensor(coordinate_lower_bounds).numel() != 3:
+            raise ValueError("two-dimensional tissue maps require two spatial dimensions")
         super().__init__(coordinate_lower_bounds, coordinate_upper_bounds, config)
         probability = np.asarray(white_matter_probability, dtype=np.float32)
         if probability.ndim != 2 or min(probability.shape) < 2:

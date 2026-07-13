@@ -39,6 +39,24 @@ def test_zero_flux_diffusion_conserves_total_mass() -> None:
     np.testing.assert_allclose(total_mass, total_mass[0], rtol=1e-12, atol=1e-12)
 
 
+def test_three_dimensional_zero_flux_diffusion_conserves_mass() -> None:
+    shape = (8, 9, 10)
+    solver = FiniteVolumeSolver(
+        diffusivity=np.full(shape, 0.1),
+        brain_mask=np.ones(shape, dtype=bool),
+        parameters=ReactionDiffusionParameters(proliferation_rate=0.0),
+        spacing=(1.0, 1.0, 1.0),
+    )
+    density = np.zeros(shape)
+    density[3:5, 3:6, 4:7] = 0.5
+
+    result = solver.simulate(density, np.array([0.0, 1.0, 2.0]))
+
+    np.testing.assert_allclose(
+        result.density.sum(axis=(1, 2, 3)), result.density[0].sum(), rtol=1e-12
+    )
+
+
 def test_uniform_logistic_growth_matches_analytical_solution() -> None:
     rate = 0.08
     initial_value = 0.1

@@ -21,6 +21,10 @@ class CavityAwareTumorPINN(TumorPINN):
         cavity_radius: float,
         config: PINNConfig | None = None,
     ) -> None:
+        if torch.as_tensor(coordinate_lower_bounds).numel() != 3:
+            raise ValueError("circular cavity models require two spatial dimensions")
+        if config is not None and config.fourier_frequencies:
+            raise ValueError("circular cavity feature maps do not accept Fourier features")
         if cavity_radius <= 0:
             raise ValueError("cavity_radius must be positive")
         if len(cavity_center) != 2:
@@ -66,6 +70,10 @@ class PiecewiseCavityTumorPINN(TumorPINN):
         interface_radius: float,
         config: PINNConfig | None = None,
     ) -> None:
+        if torch.as_tensor(coordinate_lower_bounds).numel() != 3:
+            raise ValueError("circular cavity models require two spatial dimensions")
+        if config is not None and config.fourier_frequencies:
+            raise ValueError("circular cavity feature maps do not accept Fourier features")
         if cavity_radius <= 0:
             raise ValueError("cavity_radius must be positive")
         if interface_radius <= cavity_radius:

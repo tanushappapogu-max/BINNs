@@ -24,7 +24,7 @@ class SimulationResult:
 
 
 class FiniteVolumeSolver:
-    """Solve a two-dimensional variable-coefficient Fisher-KPP equation."""
+    """Solve a masked variable-coefficient Fisher-KPP equation in any dimension."""
 
     def __init__(
         self,
@@ -32,19 +32,19 @@ class FiniteVolumeSolver:
         brain_mask: BoolArray,
         parameters: ReactionDiffusionParameters,
         *,
-        spacing: tuple[float, float] = (1.0, 1.0),
+        spacing: tuple[float, ...] = (1.0, 1.0),
         cavity_mask: BoolArray | None = None,
     ) -> None:
         diffusivity = np.asarray(diffusivity, dtype=np.float64)
         brain_mask = np.asarray(brain_mask, dtype=bool)
-        if diffusivity.ndim != 2:
-            raise ValueError("diffusivity must be a two-dimensional array")
+        if diffusivity.ndim < 1:
+            raise ValueError("diffusivity must contain at least one spatial dimension")
         if brain_mask.shape != diffusivity.shape:
             raise ValueError("brain_mask must match diffusivity shape")
         if np.any(~np.isfinite(diffusivity)) or np.any(diffusivity < 0):
             raise ValueError("diffusivity must contain finite nonnegative values")
-        if len(spacing) != 2 or any(value <= 0 for value in spacing):
-            raise ValueError("spacing values must be positive")
+        if len(spacing) != diffusivity.ndim or any(value <= 0 for value in spacing):
+            raise ValueError("spacing must provide one positive value per spatial dimension")
 
         if cavity_mask is None:
             cavity_mask = np.zeros_like(brain_mask)
@@ -56,7 +56,7 @@ class FiniteVolumeSolver:
                 raise ValueError("cavity_mask must be contained within brain_mask")
 
         self.parameters = parameters
-        self.spacing = (float(spacing[0]), float(spacing[1]))
+        self.spacing = tuple(float(value) for value in spacing)
         self.cavity_mask = cavity_mask.copy()
         self.active_mask = brain_mask & ~cavity_mask
         self.diffusivity = np.where(self.active_mask, diffusivity, 0.0)
@@ -66,8 +66,7 @@ class FiniteVolumeSolver:
         if maximum_treatment_rate < 0:
             raise ValueError("maximum_treatment_rate must be nonnegative")
         maximum_diffusivity = float(np.max(self.diffusivity, initial=0.0))
-        dy, dx = self.spacing
-        diffusion_rate = 2.0 * maximum_diffusivity * (1.0 / dx**2 + 1.0 / dy**2)
+        diffusion_rate = 2.0 * maximum_diffusivity * sum(1.0 / value**2 for value in self.spacing)
         reaction_rate = self.parameters.maximum_reaction_slope + maximum_treatment_rate
         total_rate = diffusion_rate + reaction_rate
         return np.inf if total_rate == 0 else 0.9 / total_rate
@@ -75,17 +74,24 @@ class FiniteVolumeSolver:
     def spatial_derivative(self, density: FloatArray) -> FloatArray:
         """Return the conservative divergence of diffusive face fluxes."""
         density = self._validated_density(density)
-        dy, dx = self.spacing
-
-        x_flux = np.zeros((density.shape[0], density.shape[1] + 1), dtype=np.float64)
-        y_flux = np.zeros((density.shape[0] + 1, density.shape[1]), dtype=np.float64)
-
-        x_face_diffusivity = self._harmonic_mean(self.diffusivity[:, :-1], self.diffusivity[:, 1:])
-        y_face_diffusivity = self._harmonic_mean(self.diffusivity[:-1, :], self.diffusivity[1:, :])
-        x_flux[:, 1:-1] = x_face_diffusivity * np.diff(density, axis=1) / dx
-        y_flux[1:-1, :] = y_face_diffusivity * np.diff(density, axis=0) / dy
-
-        divergence = np.diff(x_flux, axis=1) / dx + np.diff(y_flux, axis=0) / dy
+        divergence = np.zeros_like(density)
+        for axis, axis_spacing in enumerate(self.spacing):
+            lower = [slice(None)] * density.ndim
+            upper = [slice(None)] * density.ndim
+            lower[axis] = slice(None, -1)
+            upper[axis] = slice(1, None)
+            face_diffusivity = self._harmonic_mean(
+                self.diffusivity[tuple(lower)], self.diffusivity[tuple(upper)]
+            )
+            flux_shape = list(density.shape)
+            flux_shape[axis] += 1
+            flux = np.zeros(flux_shape, dtype=np.float64)
+            interior_faces = [slice(None)] * density.ndim
+            interior_faces[axis] = slice(1, -1)
+            flux[tuple(interior_faces)] = (
+                face_diffusivity * np.diff(density, axis=axis) / axis_spacing
+            )
+            divergence += np.diff(flux, axis=axis) / axis_spacing
         return np.where(self.active_mask, divergence, 0.0)
 
     def simulate(
