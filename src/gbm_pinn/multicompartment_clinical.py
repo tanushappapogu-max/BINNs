@@ -11,7 +11,7 @@ import torch
 from numpy.typing import NDArray
 from scipy import ndimage
 
-from gbm_pinn.clinical import load_longitudinal_segmentations
+from gbm_pinn.clinical import LongitudinalSegmentations, load_longitudinal_segmentations
 from gbm_pinn.clinical_3d_experiment import (
     _sample_volume_boundary,
     _sample_volume_interior,
@@ -47,6 +47,7 @@ class MultiCompartmentClinicalConfig:
     scan_days: tuple[float, ...]
     observation_count: int = 3
     forecast_index: int = 3
+    scan_start_index: int = 0
     data_points_per_time: int = 8_192
     collocation_points: int = 16_384
     boundary_points: int = 4_096
@@ -68,7 +69,10 @@ class MultiCompartmentClinicalConfig:
     artifact_path: Path | None = None
 
     def __post_init__(self) -> None:
-        if not 1 <= self.observation_count <= self.forecast_index < len(self.scan_days):
+        if self.scan_start_index < 0:
+            raise ValueError("scan_start_index must be nonnegative")
+        available_scans = len(self.scan_days) - self.scan_start_index
+        if not 1 <= self.observation_count <= self.forecast_index < available_scans:
             raise ValueError("observations must precede a valid held-out forecast index")
         if min(self.data_points_per_time, self.collocation_points, self.boundary_points) <= 0:
             raise ValueError("sample counts must be positive")
@@ -100,6 +104,7 @@ class MultiCompartmentClinicalResult:
     losses: dict[str, float]
     channel_metrics: dict[str, dict[str, float | bool | int | None]]
     whole_abnormality_metrics: dict[str, float | bool | int | None]
+    scenario_disagreement: dict[str, float | int]
 
 
 def run_multicompartment_clinical(
@@ -110,7 +115,14 @@ def run_multicompartment_clinical(
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
-    scans = load_longitudinal_segmentations(config.patient_directory, config.scan_days)
+    all_scans = load_longitudinal_segmentations(config.patient_directory, config.scan_days)
+    start = config.scan_start_index
+    scans = LongitudinalSegmentations(
+        all_scans.labels[start:],
+        all_scans.days[start:],
+        all_scans.affine,
+        all_scans.paths[start:],
+    )
     labels = scans.labels[: config.forecast_index + 1]
     spacing = tuple(float(value) for value in _voxel_spacing(scans.affine))
     brain = _load_observation_brain_mask(
@@ -284,6 +296,9 @@ def run_multicompartment_clinical(
     whole_metrics = _metrics(
         predicted_whole, target_whole, persistence_whole, brain, config.threshold
     )
+    scenario_disagreement = _scenario_disagreement(
+        predicted_whole, persistence_whole, brain, config.threshold
+    )
     if config.artifact_path is not None:
         config.artifact_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -298,6 +313,11 @@ def run_multicompartment_clinical(
             initial_viable=initial_viable,
             initial_edema=initial_edema,
             initial_necrotic=initial_necrotic,
+            scenario_disagreement_mask=(
+                (predicted_whole >= config.threshold)
+                != (persistence_whole >= config.threshold)
+            )
+            & brain,
         )
     return MultiCompartmentClinicalResult(
         resolved_device=str(device),
@@ -318,6 +338,7 @@ def run_multicompartment_clinical(
         },
         channel_metrics=channel_metrics,
         whole_abnormality_metrics=whole_metrics,
+        scenario_disagreement=scenario_disagreement,
     )
 
 
@@ -501,4 +522,32 @@ def _metrics(
         "volume_relative_error": _masked_volume_error(
             prediction, target, mask, threshold
         ),
+    }
+
+
+def _scenario_disagreement(
+    mechanistic: FloatArray,
+    persistence: FloatArray,
+    mask: BoolArray,
+    threshold: float,
+) -> dict[str, float | int]:
+    """Quantify disagreement between two target-independent forecast scenarios."""
+    mechanistic_mask = (mechanistic >= threshold) & mask
+    persistence_mask = (persistence >= threshold) & mask
+    changed = mechanistic_mask != persistence_mask
+    denominator = int(mechanistic_mask.sum() + persistence_mask.sum())
+    agreement_dice = (
+        1.0
+        if denominator == 0
+        else float(2 * np.sum(mechanistic_mask & persistence_mask) / denominator)
+    )
+    brain_voxels = int(mask.sum())
+    return {
+        "scenario_agreement_dice": agreement_dice,
+        "disagreement_voxels": int(changed.sum()),
+        "disagreement_fraction_of_brain": (
+            float(changed.sum() / brain_voxels) if brain_voxels else 0.0
+        ),
+        "mechanistic_voxels": int(mechanistic_mask.sum()),
+        "persistence_voxels": int(persistence_mask.sum()),
     }

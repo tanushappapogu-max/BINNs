@@ -112,10 +112,16 @@ class MultiCompartmentTrainingConfig:
     radiation_jump_weight: float = 1.0
     normalize_loss_terms: bool = False
     loss_scale_floor: float = 1e-8
+    field_warmup_epochs: int = 0
+    parameter_calibration_epochs: int = 0
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
             raise ValueError("epochs must be positive")
+        if self.field_warmup_epochs < 0 or self.parameter_calibration_epochs < 0:
+            raise ValueError("staged-training epoch counts must be nonnegative")
+        if self.field_warmup_epochs + self.parameter_calibration_epochs >= self.epochs:
+            raise ValueError("staged phases must leave at least one joint-training epoch")
         if self.network_learning_rate <= 0 or self.parameter_learning_rate <= 0:
             raise ValueError("learning rates must be positive")
         if min(
@@ -591,6 +597,16 @@ def fit_multicompartment_pinn(
         torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
 
     for epoch in range(start_epoch, config.epochs):
+        in_field_warmup = epoch < config.field_warmup_epochs
+        in_parameter_calibration = (
+            config.field_warmup_epochs
+            <= epoch
+            < config.field_warmup_epochs + config.parameter_calibration_epochs
+        )
+        for parameter in model.field_parameters():
+            parameter.requires_grad_(not in_parameter_calibration)
+        for parameter in physical_parameters:
+            parameter.requires_grad_(not in_field_warmup)
         data_indices = _batch_indices(
             data_coordinates.shape[0], config.data_batch_size, data_coordinates.device
         )
@@ -691,6 +707,8 @@ def fit_multicompartment_pinn(
                 histories,
                 loss_scales,
             )
+    for parameter in model.parameters():
+        parameter.requires_grad_(True)
     return MultiCompartmentTrainingResult(
         total_loss=tuple(histories["total"]),
         data_loss=tuple(histories["data"]),

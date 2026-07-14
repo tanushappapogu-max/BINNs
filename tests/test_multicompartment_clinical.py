@@ -1,10 +1,13 @@
 import numpy as np
+import pytest
 
 from gbm_pinn.multicompartment_clinical import (
+    MultiCompartmentClinicalConfig,
     _latent_seeded_initial_state,
     _metrics,
     _numpy_treatment_exposure,
     _sample_multicompartment_data,
+    _scenario_disagreement,
 )
 from gbm_pinn.treatment import TreatmentWindow
 
@@ -69,6 +72,19 @@ def test_metrics_marks_absent_target_as_unevaluable() -> None:
     assert result["forecast_dice"] is None
 
 
+def test_scenario_disagreement_does_not_require_future_target() -> None:
+    mechanistic = np.array([[1.0, 1.0], [0.0, 0.0]])
+    persistence = np.array([[1.0, 0.0], [0.0, 0.0]])
+
+    result = _scenario_disagreement(
+        mechanistic, persistence, np.ones_like(mechanistic, bool), 0.5
+    )
+
+    assert result["scenario_agreement_dice"] == pytest.approx(2 / 3)
+    assert result["disagreement_voxels"] == 1
+    assert result["disagreement_fraction_of_brain"] == 0.25
+
+
 def test_latent_initialization_keeps_only_history_supported_hidden_seeds() -> None:
     first = np.zeros((7, 7, 7), dtype=np.int16)
     latest = np.zeros_like(first)
@@ -123,3 +139,26 @@ def test_latest_cavity_outside_fixed_brain_is_excluded_from_solver_domain() -> N
     forward_cavity = (latest == 4) & brain
 
     assert not forward_cavity.any()
+
+
+def test_clinical_config_accepts_rolling_scan_origin(tmp_path) -> None:
+    config = MultiCompartmentClinicalConfig(
+        patient_directory=tmp_path,
+        scan_days=(0.0, 7.0, 14.0, 21.0, 28.0, 35.0),
+        observation_count=3,
+        forecast_index=3,
+        scan_start_index=2,
+    )
+
+    assert config.scan_start_index == 2
+
+
+def test_clinical_config_rejects_rolling_origin_without_forecast(tmp_path) -> None:
+    with pytest.raises(ValueError, match="held-out forecast"):
+        MultiCompartmentClinicalConfig(
+            patient_directory=tmp_path,
+            scan_days=(0.0, 7.0, 14.0, 21.0, 28.0),
+            observation_count=3,
+            forecast_index=3,
+            scan_start_index=2,
+        )

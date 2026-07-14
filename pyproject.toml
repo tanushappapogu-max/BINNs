@@ -24,6 +24,11 @@ ml = [
 imaging = [
   "nibabel>=5.3,<6",
 ]
+datasets = [
+  "nibabel>=5.3,<6",
+  "openpyxl>=3.1,<4",
+  "remotezip>=0.12,<1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gbm_pinn"]

@@ -31,6 +31,7 @@ KNOWN_TREATMENT_MODALITIES = (
     | ANTIANGIOGENIC_MODALITIES
     | DEFERRED_EVENT_MODALITIES
 )
+COHORT_ROLES = frozenset({"training", "model_selection", "final_test"})
 
 
 def load_multicompartment_manifest(path: Path) -> dict[str, Any]:
@@ -42,11 +43,23 @@ def load_multicompartment_manifest(path: Path) -> dict[str, Any]:
     if not manifest["patients"]:
         raise ValueError("manifest must contain at least one patient")
     seen: set[str] = set()
+    dataset = manifest.get("dataset")
+    if dataset is not None and (not isinstance(dataset, str) or not dataset.strip()):
+        raise ValueError("dataset must be a nonempty string when provided")
     for patient in manifest["patients"]:
+        if not isinstance(patient, dict):
+            raise ValueError("each patient entry must be an object")
         patient_id = patient.get("patient_id")
         if not isinstance(patient_id, str) or not patient_id or patient_id in seen:
             raise ValueError("patient IDs must be nonempty and unique")
         seen.add(patient_id)
+        role = patient.get("role")
+        if role not in COHORT_ROLES:
+            raise ValueError(f"{patient_id} has invalid cohort role: {role}")
+        source = patient.get("source", dataset)
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(f"{patient_id} requires a nonempty dataset source")
+        patient["source"] = source
         scan_days = patient.get("scan_days")
         if not isinstance(scan_days, list) or len(scan_days) < 4:
             raise ValueError(f"{patient_id} requires at least four scan days")
@@ -83,6 +96,11 @@ def summarize_training(records: list[dict[str, Any]]) -> dict[str, Any]:
         float(record["whole_abnormality_metrics"]["volume_relative_error"])
         for record in evaluable
     ]
+    scenario_agreements = [
+        float(record["scenario_disagreement"]["scenario_agreement_dice"])
+        for record in successful
+        if "scenario_disagreement" in record
+    ]
     return {
         "n_planned": len(records),
         "n_successful": len(successful),
@@ -95,6 +113,9 @@ def summarize_training(records: list[dict[str, Any]]) -> dict[str, Any]:
         "median_volume_relative_error": (
             float(np.median(volume_errors)) if volume_errors else None
         ),
+        "median_mechanistic_persistence_agreement_dice": (
+            float(np.median(scenario_agreements)) if scenario_agreements else None
+        ),
     }
 
 
@@ -105,8 +126,10 @@ def run_multicompartment_training_cohort(
     *,
     device: str = "auto",
     selected_patient_ids: set[str] | None = None,
+    included_roles: set[str] | None = None,
     edema_half_saturation: float | None = None,
     enable_systemic_cell_kill: bool = False,
+    protocol_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = load_multicompartment_manifest(manifest_path)
     protocol = dict(manifest["protocol"])
@@ -115,19 +138,37 @@ def run_multicompartment_training_cohort(
             raise ValueError("edema_half_saturation must be finite and positive")
         protocol["edema_half_saturation"] = edema_half_saturation
     protocol["enable_systemic_cell_kill"] = enable_systemic_cell_kill
+    if protocol_overrides:
+        protocol.update(protocol_overrides)
     patients = manifest["patients"]
+    roles = {"training"} if included_roles is None else included_roles
+    if unknown_roles := roles - COHORT_ROLES:
+        raise ValueError(f"unknown cohort roles: {', '.join(sorted(unknown_roles))}")
+    patients = [patient for patient in patients if patient["role"] in roles]
     if selected_patient_ids is not None:
-        known = {patient["patient_id"] for patient in patients}
+        known = {patient["patient_id"] for patient in manifest["patients"]}
         if unknown := selected_patient_ids - known:
             raise ValueError(f"unknown patient IDs: {', '.join(sorted(unknown))}")
+        excluded = selected_patient_ids - {patient["patient_id"] for patient in patients}
+        if excluded:
+            raise ValueError(
+                "selected patients are outside the enabled cohort roles: "
+                + ", ".join(sorted(excluded))
+            )
         patients = [p for p in patients if p["patient_id"] in selected_patient_ids]
+    if not patients:
+        raise ValueError("no patients remain after cohort role and patient filtering")
     output_root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     for index, patient in enumerate(patients, start=1):
         patient_id = patient["patient_id"]
         patient_output = output_root / patient_id
         print(f"[{index}/{len(patients)}] {patient_id}: training", flush=True)
-        record: dict[str, Any] = {"patient_id": patient_id, "role": patient["role"]}
+        record: dict[str, Any] = {
+            "patient_id": patient_id,
+            "role": patient["role"],
+            "source": patient["source"],
+        }
         try:
             result = run_multicompartment_clinical(
                 _clinical_config(patient, protocol, data_root, patient_output, device)
@@ -170,6 +211,7 @@ def _clinical_config(
         scan_days=tuple(float(day) for day in patient["scan_days"]),
         observation_count=int(protocol["observation_count"]),
         forecast_index=int(protocol["forecast_index"]),
+        scan_start_index=int(protocol.get("scan_start_index", 0)),
         data_points_per_time=int(protocol["data_points_per_time"]),
         collocation_points=int(protocol["collocation_points"]),
         boundary_points=int(protocol["boundary_points"]),
@@ -196,6 +238,10 @@ def _clinical_config(
             epochs=int(protocol["epochs"]),
             detection_limits=tuple(float(v) for v in protocol["detection_limits"]),
             normalize_loss_terms=True,
+            field_warmup_epochs=int(protocol.get("field_warmup_epochs", 0)),
+            parameter_calibration_epochs=int(
+                protocol.get("parameter_calibration_epochs", 0)
+            ),
         ),
         checkpoint_path=output / "checkpoint.pt",
         artifact_path=output / "forecast.npz",

@@ -198,6 +198,30 @@ def test_training_can_normalize_loss_families_to_initial_scales() -> None:
     assert np.all(np.isfinite(result.total_loss))
 
 
+def test_staged_training_freezes_field_then_physical_parameters() -> None:
+    torch.manual_seed(9)
+    model = MultiCompartmentPINN(
+        torch.tensor([0.0, 0.0, 0.0]),
+        torch.tensor([1.0, 1.0, 1.0]),
+    )
+
+    result = fit_multicompartment_pinn(
+        model,
+        torch.rand(12, 3),
+        torch.zeros(12, 3),
+        torch.rand(10, 3),
+        config=MultiCompartmentTrainingConfig(
+            epochs=3,
+            field_warmup_epochs=1,
+            parameter_calibration_epochs=1,
+        ),
+    )
+
+    assert len(result.total_loss) == 3
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    assert np.all(np.isfinite(result.total_loss))
+
+
 def test_multicompartment_training_resumes_from_checkpoint(tmp_path) -> None:
     torch.manual_seed(5)
     lower = torch.tensor([0.0, 0.0, 0.0])
