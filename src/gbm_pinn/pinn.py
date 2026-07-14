@@ -484,8 +484,8 @@ def fit_pinn(
         boundary_history.append(float(boundary_loss.detach()))
         interface_history.append(float(interface_loss.detach()))
 
-    time_lower = float(model.coordinate_lower_bounds[2].detach().cpu())
-    time_upper = float(model.coordinate_upper_bounds[2].detach().cpu())
+    time_lower = float(model.coordinate_lower_bounds[-1].detach().cpu())
+    time_upper = float(model.coordinate_upper_bounds[-1].detach().cpu())
     for epoch in range(start_epoch, config.epochs):
         current_time_upper: float | None = None
         if config.causal_time_chunks > 1:

@@ -78,6 +78,8 @@ def build_mu_transition_index(
             source_morphology = source_morphology_features(
                 scans.labels[source_index], scans.affine
             )
+            history_available = source_index > 0
+            previous_index = source_index - 1 if history_available else source_index
             transitions.append(
                 {
                     "transition_id": f"{patient_id}_T{source_index + 1}_to_T{target_index + 1}",
@@ -91,6 +93,11 @@ def build_mu_transition_index(
                     "horizon_days": scans.days[target_index] - scans.days[source_index],
                     "source_segmentation": str(scans.paths[source_index]),
                     "target_segmentation": str(scans.paths[target_index]),
+                    "history_available": history_available,
+                    "previous_day": scans.days[previous_index] if history_available else None,
+                    "previous_segmentation": (
+                        str(scans.paths[previous_index]) if history_available else None
+                    ),
                     "treatment_exposure": exposure,
                     "source_morphology": source_morphology,
                 }

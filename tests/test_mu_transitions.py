@@ -76,6 +76,9 @@ def test_transition_index_defaults_to_training_patients(tmp_path) -> None:
         == pytest.approx(10 / 15)
     )
     assert result["transitions"][0]["source_morphology"]["enhancing_volume_ml"] > 0
+    assert result["transitions"][0]["history_available"] is False
+    assert result["transitions"][1]["history_available"] is True
+    assert result["transitions"][1]["previous_day"] == 0
 
 
 def test_transition_index_reports_missing_patients_without_leaking_roles(tmp_path) -> None:
