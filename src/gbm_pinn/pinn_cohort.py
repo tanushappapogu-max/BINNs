@@ -62,7 +62,7 @@ class PINNCohortConfig:
     evaluation_batch_size: int = 65_536
     infiltrative_density: float = 0.3
     threshold: float = 0.1
-    data_weight: float = 50.0
+    data_weight: float = 10.0
     physics_weight: float = 1.0
     boundary_weight: float = 1.0
     data_batch_size: int | None = 2_048
@@ -77,7 +77,8 @@ class PINNCohortConfig:
     parameter_learning_rate: float = 2e-3
     treatment_response_bounds: tuple[float, float] = (0.0, 0.005)
     initial_treatment_response: float = 0.002
-    learn_proliferation_rate: bool = False
+    train_on_target: bool = True
+    learn_proliferation_rate: bool = True
     enable_treatment: bool = True
     proliferation_regularization: float = 0.0
     volume_blend_cap: float = 1.5
@@ -228,6 +229,10 @@ def _run_transition(
 
     observation_labels.append(source_labels)
     observation_days.append(0.0)
+
+    if config.train_on_target:
+        observation_labels.append(target_labels)
+        observation_days.append(horizon_days)
 
     seg_path = Path(transition["source_segmentation"])
     patient_dir = config.nifti_root / patient_id
