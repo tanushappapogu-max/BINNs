@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 from gbm_pinn.pinn_cohort import (
     _build_brain_mask_fallback,

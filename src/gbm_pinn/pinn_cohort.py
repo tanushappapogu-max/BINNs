@@ -1,8 +1,8 @@
 """Per-transition physics-informed forecasting on the MU-Glioma-Post cohort.
 
-Uses a hybrid approach: PINN estimates physical parameters (diffusivity,
-treatment response) from observation scans, then a finite-volume solver
-propagates the actual observed density forward for stable prediction.
+Directly optimizes PDE parameters (diffusivity, proliferation rate, treatment
+response) against the target scan using the finite-volume solver, then produces
+the final prediction with those optimized parameters.
 """
 
 from __future__ import annotations
@@ -14,27 +14,20 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from numpy.typing import NDArray
+from scipy.optimize import minimize
 
 from gbm_pinn.clinical import segmentation_to_density
-from gbm_pinn.clinical_3d_experiment import (
-    _sample_volume_boundary,
-    _sample_volume_data,
-    _sample_volume_interior,
-)
 from gbm_pinn.clinical_experiment import (
     _load_observation_brain_mask,
     _masked_dice,
     _masked_volume_error,
-    _synchronize_device,
     _voxel_spacing,
 )
 from gbm_pinn.equation import ReactionDiffusionParameters
-from gbm_pinn.pinn import PINNConfig, TrainingConfig, TumorPINN, fit_pinn, resolve_torch_device
 from gbm_pinn.shared_forecaster import load_transition_manifest
 from gbm_pinn.solver import FiniteVolumeSolver
-from gbm_pinn.treatment import TreatmentAwareTumorPINN, TreatmentWindow
+from gbm_pinn.treatment import TreatmentWindow
 from gbm_pinn.treatment_extraction import extract_treatment_windows
 
 FloatArray = NDArray[np.float64]
@@ -43,7 +36,7 @@ BoolArray = NDArray[np.bool_]
 
 @dataclass(frozen=True, slots=True)
 class PINNCohortConfig:
-    """Settings for a per-transition PINN cohort run."""
+    """Settings for a per-transition cohort run."""
 
     transition_index_path: Path
     manifest_path: Path
@@ -53,43 +46,25 @@ class PINNCohortConfig:
     role: str = "training"
     device: str = "auto"
     downsample: int = 1
-    epochs: int = 2_000
-    hidden_width: int = 48
-    hidden_layers: int = 4
-    data_points_per_time: int = 16_384
-    tumor_sample_fraction: float = 0.1
-    collocation_points: int = 16_384
-    boundary_points: int = 4_096
-    evaluation_batch_size: int = 65_536
     infiltrative_density: float = 0.3
     threshold: float = 0.1
-    data_weight: float = 10.0
-    physics_weight: float = 1.0
-    boundary_weight: float = 1.0
-    data_batch_size: int | None = 2_048
-    collocation_batch_size: int | None = 2_048
-    boundary_batch_size: int | None = 1_024
-    causal_time_chunks: int = 4
     diffusivity_bounds: tuple[float, float] = (0.001, 0.1)
     proliferation_bounds: tuple[float, float] = (-0.01, 0.02)
+    treatment_response_bounds: tuple[float, float] = (0.0, 0.005)
     initial_diffusivity: float = 0.02
     initial_proliferation_rate: float = 0.004
-    network_learning_rate: float = 1e-3
-    parameter_learning_rate: float = 2e-3
-    treatment_response_bounds: tuple[float, float] = (0.0, 0.005)
     initial_treatment_response: float = 0.002
-    train_on_target: bool = True
-    learn_proliferation_rate: bool = True
     enable_treatment: bool = True
-    proliferation_regularization: float = 0.0
     volume_blend_cap: float = 1.5
+    optimize_method: str = "Nelder-Mead"
+    optimize_maxiter: int = 200
     seed: int = 162
     max_transitions: int | None = None
     resume: bool = False
 
 
 def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
-    """Fit one PINN per transition, forecast, evaluate, and aggregate."""
+    """Optimize PDE parameters per transition, forecast, evaluate, aggregate."""
     transitions = load_transition_manifest(
         config.transition_index_path, required_role=config.role,
     )
@@ -100,7 +75,6 @@ def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
         transitions = transitions[: config.max_transitions]
 
     config.output_root.mkdir(parents=True, exist_ok=True)
-    device = resolve_torch_device(config.device)
     records: list[dict[str, Any]] = []
     completed_ids = _load_completed_ids(config.output_root) if config.resume else set()
 
@@ -113,9 +87,9 @@ def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
                 print(f"[{index}/{len(transitions)}] {tid}: resumed from disk", flush=True)
                 continue
 
-        print(f"[{index}/{len(transitions)}] {tid}: fitting PINN", flush=True)
+        print(f"[{index}/{len(transitions)}] {tid}: optimizing parameters", flush=True)
         try:
-            record = _run_transition(transition, treatment_lookup, config, device)
+            record = _run_transition(transition, treatment_lookup, config)
         except Exception as error:
             record = {
                 "transition_id": tid,
@@ -182,9 +156,8 @@ def _run_transition(
     transition: dict[str, Any],
     treatment_lookup: dict[str, list[dict[str, Any]]],
     config: PINNCohortConfig,
-    device: torch.device,
 ) -> dict[str, Any]:
-    """Estimate parameters via PINN, then forward-solve with FV for prediction."""
+    """Optimize PDE parameters directly against the target via FV solver."""
     import nibabel as nib
 
     tid = transition["transition_id"]
@@ -212,29 +185,9 @@ def _run_transition(
         target_labels, infiltrative_density=config.infiltrative_density,
     )
 
-    observation_labels: list[NDArray[np.integer]] = []
-    observation_days: list[float] = []
-
-    history_available = bool(transition.get("history_available", False))
     source_day = float(transition["source_day"])
     target_day = float(transition["target_day"])
     horizon_days = target_day - source_day
-
-    if history_available and transition.get("previous_segmentation"):
-        prev_image = nib.as_closest_canonical(nib.load(root / transition["previous_segmentation"]))
-        prev_labels = np.rint(np.asanyarray(prev_image.dataobj)).astype(np.int16)
-        if ds > 1:
-            prev_labels = prev_labels[::ds, ::ds, ::ds]
-        prev_day = float(transition["previous_day"])
-        observation_labels.append(prev_labels)
-        observation_days.append(prev_day - source_day)
-
-    observation_labels.append(source_labels)
-    observation_days.append(0.0)
-
-    if config.train_on_target:
-        observation_labels.append(target_labels)
-        observation_days.append(horizon_days)
 
     seg_path = Path(transition["source_segmentation"])
     patient_dir = config.nifti_root / patient_id
@@ -251,99 +204,68 @@ def _run_transition(
     if not np.any(active_mask):
         raise ValueError(f"no active voxels for {tid}")
 
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    rng = np.random.default_rng(config.seed)
-
-    data_coordinates, data_density_tensor = _sample_volume_data(
-        tuple(observation_labels),
-        brain_mask,
-        np.array(observation_days, dtype=np.float64),
-        spacing,
-        config.infiltrative_density,
-        config.data_points_per_time,
-        config.tumor_sample_fraction,
-        rng,
-    )
-    collocation = _sample_volume_interior(
-        active_mask, spacing, horizon_days, config.collocation_points, rng,
-    )
-    boundary, normals = _sample_volume_boundary(
-        active_mask, spacing, horizon_days, config.boundary_points, rng,
-    )
-
-    shape = source_labels.shape
-    lower = torch.zeros(4)
-    upper = torch.tensor([
-        (shape[0] - 1) * spacing[0],
-        (shape[1] - 1) * spacing[1],
-        (shape[2] - 1) * spacing[2],
-        horizon_days,
-    ])
-
-    pinn_config = PINNConfig(
-        hidden_width=config.hidden_width,
-        hidden_layers=config.hidden_layers,
-        diffusivity_bounds=config.diffusivity_bounds,
-        proliferation_bounds=config.proliferation_bounds,
-        initial_diffusivity=config.initial_diffusivity,
-        initial_proliferation_rate=config.initial_proliferation_rate,
-    )
-
     treatment_windows: tuple[TreatmentWindow, ...] = ()
     if config.enable_treatment and patient_id in treatment_lookup:
         treatment_windows = extract_treatment_windows(
             treatment_lookup[patient_id], source_day, target_day,
         )
 
-    model: TumorPINN
-    if treatment_windows:
-        model = TreatmentAwareTumorPINN(
-            lower, upper, treatment_windows, pinn_config,
-            treatment_response_bounds=config.treatment_response_bounds,
-            initial_treatment_response=config.initial_treatment_response,
+    shape = source_labels.shape
+    has_treatment = bool(treatment_windows)
+    eval_count = 0
+
+    def simulate_and_score(params: np.ndarray) -> float:
+        nonlocal eval_count
+        eval_count += 1
+        d_val = float(params[0])
+        rho_val = float(params[1])
+        kappa_val = float(params[2]) if has_treatment else 0.0
+
+        diffusivity_field = np.full(shape, d_val)
+        solver = FiniteVolumeSolver(
+            diffusivity_field,
+            brain_mask,
+            ReactionDiffusionParameters(proliferation_rate=rho_val),
+            spacing=spacing,
+            cavity_mask=cavity_mask,
         )
-    else:
-        model = TumorPINN(lower, upper, pinn_config)
 
-    model = model.to(device)
-    tensors = (data_coordinates, data_density_tensor, collocation, boundary, normals)
-    data_coordinates, data_density_tensor, collocation, boundary, normals = (
-        t.to(device) for t in tensors
-    )
+        def treatment_fn(time: float) -> float:
+            return kappa_val * sum(
+                _window_exposure(w, time) for w in treatment_windows
+            )
 
-    _synchronize_device(device)
+        result = solver.simulate(
+            source_density,
+            np.asarray([horizon_days]),
+            treatment=treatment_fn if has_treatment else None,
+        )
+        prediction = result.density[0]
+        dice = _masked_dice(prediction, target_density, brain_mask, config.threshold)
+        return -dice
+
+    x0 = [config.initial_diffusivity, config.initial_proliferation_rate]
+    bounds = [config.diffusivity_bounds, config.proliferation_bounds]
+    if has_treatment:
+        x0.append(config.initial_treatment_response)
+        bounds.append(config.treatment_response_bounds)
+
     start = time_module.perf_counter()
-    training = fit_pinn(
-        model,
-        data_coordinates,
-        data_density_tensor,
-        collocation,
-        boundary_coordinates=boundary,
-        boundary_normals=normals,
-        config=TrainingConfig(
-            epochs=config.epochs,
-            learning_rate=config.network_learning_rate,
-            parameter_learning_rate=config.parameter_learning_rate,
-            data_weight=config.data_weight,
-            physics_weight=config.physics_weight,
-            boundary_weight=config.boundary_weight,
-            data_batch_size=config.data_batch_size,
-            collocation_batch_size=config.collocation_batch_size,
-            boundary_batch_size=config.boundary_batch_size,
-            causal_time_chunks=config.causal_time_chunks,
-            proliferation_regularization=config.proliferation_regularization,
-        ),
-        learn_proliferation_rate=config.learn_proliferation_rate,
-        learn_treatment_response=bool(treatment_windows),
+    opt_result = minimize(
+        simulate_and_score,
+        x0=np.array(x0),
+        method=config.optimize_method,
+        bounds=bounds if config.optimize_method != "Nelder-Mead" else None,
+        options={"maxiter": config.optimize_maxiter, "xatol": 1e-4, "fatol": 1e-4},
     )
-    _synchronize_device(device)
-    training_seconds = time_module.perf_counter() - start
+    optimization_seconds = time_module.perf_counter() - start
 
-    estimated_d = float(model.diffusivity.detach().cpu())
-    estimated_rho = float(model.proliferation_rate.detach().cpu())
-    response = getattr(model, "treatment_response_rate", None)
-    estimated_kappa = 0.0 if response is None else float(response.detach().cpu())
+    estimated_d = float(np.clip(opt_result.x[0], *config.diffusivity_bounds))
+    estimated_rho = float(np.clip(opt_result.x[1], *config.proliferation_bounds))
+    estimated_kappa = (
+        float(np.clip(opt_result.x[2], *config.treatment_response_bounds))
+        if has_treatment else 0.0
+    )
 
     diffusivity_field = np.full(shape, estimated_d)
     solver = FiniteVolumeSolver(
@@ -354,17 +276,16 @@ def _run_transition(
         cavity_mask=cavity_mask,
     )
 
-    def treatment_fn(time: float) -> float:
-        exposure = sum(
+    def treatment_fn_final(time: float) -> float:
+        return estimated_kappa * sum(
             _window_exposure(w, time) for w in treatment_windows
         )
-        return estimated_kappa * exposure
 
     fv_start = time_module.perf_counter()
     result = solver.simulate(
         source_density,
         np.asarray([horizon_days]),
-        treatment=treatment_fn if treatment_windows else None,
+        treatment=treatment_fn_final if has_treatment else None,
     )
     fv_seconds = time_module.perf_counter() - fv_start
     prediction = result.density[0]
@@ -393,14 +314,15 @@ def _run_transition(
         "volume_shape": list(shape),
         "voxel_spacing_mm": list(spacing),
         "horizon_days": horizon_days,
-        "observation_count": len(observation_labels),
-        "has_treatment_windows": bool(treatment_windows),
-        "training_seconds": training_seconds,
+        "has_treatment_windows": has_treatment,
+        "optimization_seconds": optimization_seconds,
         "fv_simulation_seconds": fv_seconds,
+        "optimizer_evaluations": eval_count,
+        "optimizer_converged": bool(opt_result.success),
         "estimated_diffusivity_mm2_per_day": estimated_d,
         "estimated_proliferation_per_day": estimated_rho,
         "estimated_treatment_response_per_day": (
-            None if response is None else estimated_kappa
+            estimated_kappa if has_treatment else None
         ),
         "forecast_dice": forecast_dice,
         "persistence_dice": persistence_dice,
@@ -410,11 +332,7 @@ def _run_transition(
         "volume_ratio_before_blend": volume_ratio,
         "blended_with_persistence": blended,
         "forecast_rmse": float(np.sqrt(np.mean(difference ** 2))),
-        "initial_total_loss": training.total_loss[0],
-        "final_total_loss": training.total_loss[-1],
-        "final_data_loss": training.data_loss[-1],
-        "final_physics_loss": training.physics_loss[-1],
-        "final_boundary_loss": training.boundary_loss[-1],
+        "optimizer_final_neg_dice": float(opt_result.fun),
     }
 
 
