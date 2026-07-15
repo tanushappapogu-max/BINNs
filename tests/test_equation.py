@@ -43,7 +43,6 @@ def test_weak_allee_reaction_respects_nonunit_carrying_capacity() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"proliferation_rate": -0.1}, "proliferation_rate"),
         ({"proliferation_rate": 0.1, "carrying_capacity": 0.0}, "carrying_capacity"),
         ({"proliferation_rate": 0.1, "growth_law": "unknown"}, "growth_law"),
         (
@@ -63,3 +62,12 @@ def test_weak_allee_reaction_respects_nonunit_carrying_capacity() -> None:
 def test_parameters_reject_nonphysical_values(kwargs: dict[str, object], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         ReactionDiffusionParameters(**kwargs)
+
+
+def test_negative_proliferation_rate_produces_decay() -> None:
+    parameters = ReactionDiffusionParameters(proliferation_rate=-0.1)
+    density = np.array([0.0, 0.5, 0.8])
+    reaction = parameters.reaction(density, treatment_rate=0.0)
+    assert reaction[0] == 0.0
+    assert reaction[1] < 0.0
+    assert reaction[2] < 0.0

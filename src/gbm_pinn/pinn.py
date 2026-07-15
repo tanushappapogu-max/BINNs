@@ -87,6 +87,7 @@ class TrainingConfig:
     interface_batch_size: int | None = None
     causal_time_chunks: int = 1
     checkpoint_interval: int | None = None
+    proliferation_regularization: float = 0.0
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -469,6 +470,8 @@ def fit_pinn(
             + config.boundary_weight * boundary_loss
             + config.interface_weight * interface_loss
         )
+        if config.proliferation_regularization > 0:
+            total_loss = total_loss + config.proliferation_regularization * model.proliferation_rate ** 2
         return total_loss, data_loss, physics_loss, boundary_loss, interface_loss
 
     def record_losses(
@@ -631,8 +634,8 @@ def _paired_time_prefix(
 
 def _validate_bounded_initial_value(value: float, bounds: tuple[float, float], name: str) -> None:
     lower, upper = bounds
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower < 0 or lower >= upper:
-        raise ValueError(f"{name} bounds must be nonnegative, finite, and strictly ordered")
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError(f"{name} bounds must be finite and strictly ordered")
     if not lower < value < upper:
         raise ValueError(f"{name} must lie strictly inside its bounds")
 

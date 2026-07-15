@@ -69,16 +69,18 @@ class PINNCohortConfig:
     collocation_batch_size: int | None = 2_048
     boundary_batch_size: int | None = 1_024
     causal_time_chunks: int = 4
-    diffusivity_bounds: tuple[float, float] = (0.001, 0.5)
-    proliferation_bounds: tuple[float, float] = (0.001, 0.03)
-    initial_diffusivity: float = 0.05
-    initial_proliferation_rate: float = 0.01
+    diffusivity_bounds: tuple[float, float] = (0.001, 0.1)
+    proliferation_bounds: tuple[float, float] = (-0.01, 0.02)
+    initial_diffusivity: float = 0.02
+    initial_proliferation_rate: float = 0.004
     network_learning_rate: float = 1e-3
     parameter_learning_rate: float = 2e-3
-    treatment_response_bounds: tuple[float, float] = (0.0, 0.1)
-    initial_treatment_response: float = 0.015
+    treatment_response_bounds: tuple[float, float] = (0.0, 0.005)
+    initial_treatment_response: float = 0.002
     learn_proliferation_rate: bool = False
     enable_treatment: bool = True
+    proliferation_regularization: float = 0.0
+    volume_blend_cap: float = 1.5
     seed: int = 162
     max_transitions: int | None = None
     resume: bool = False
@@ -323,6 +325,7 @@ def _run_transition(
             collocation_batch_size=config.collocation_batch_size,
             boundary_batch_size=config.boundary_batch_size,
             causal_time_chunks=config.causal_time_chunks,
+            proliferation_regularization=config.proliferation_regularization,
         ),
         learn_proliferation_rate=config.learn_proliferation_rate,
         learn_treatment_response=bool(treatment_windows),
@@ -359,6 +362,15 @@ def _run_transition(
     fv_seconds = time_module.perf_counter() - fv_start
     prediction = result.density[0]
 
+    source_volume = float(np.sum(source_density[brain_mask] > config.threshold))
+    predicted_volume = float(np.sum(prediction[brain_mask] > config.threshold))
+    volume_ratio = predicted_volume / max(source_volume, 1.0)
+    blended = False
+    if volume_ratio > config.volume_blend_cap and config.volume_blend_cap > 0:
+        alpha = config.volume_blend_cap / volume_ratio
+        prediction = alpha * prediction + (1.0 - alpha) * source_density
+        blended = True
+
     forecast_dice = _masked_dice(prediction, target_density, brain_mask, config.threshold)
     persistence_dice = _masked_dice(source_density, target_density, brain_mask, config.threshold)
     volume_error = _masked_volume_error(
@@ -388,6 +400,8 @@ def _run_transition(
         "dice_skill_over_persistence": forecast_dice - persistence_dice,
         "beats_persistence": forecast_dice > persistence_dice,
         "forecast_volume_relative_error": volume_error,
+        "volume_ratio_before_blend": volume_ratio,
+        "blended_with_persistence": blended,
         "forecast_rmse": float(np.sqrt(np.mean(difference ** 2))),
         "initial_total_loss": training.total_loss[0],
         "final_total_loss": training.total_loss[-1],

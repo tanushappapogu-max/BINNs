@@ -20,8 +20,6 @@ class ReactionDiffusionParameters:
     allee_parameter: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.proliferation_rate < 0:
-            raise ValueError("proliferation_rate must be nonnegative")
         if self.carrying_capacity <= 0:
             raise ValueError("carrying_capacity must be positive")
         if self.growth_law not in ("logistic", "weak_allee"):
@@ -35,8 +33,8 @@ class ReactionDiffusionParameters:
     def maximum_reaction_slope(self) -> float:
         """Return a conservative reaction-rate scale for explicit stepping."""
         if self.growth_law == "logistic":
-            return self.proliferation_rate
-        return self.proliferation_rate * (1.0 + self.allee_parameter)
+            return abs(self.proliferation_rate)
+        return abs(self.proliferation_rate) * (1.0 + self.allee_parameter)
 
     def reaction(self, density: ArrayLike, treatment_rate: ArrayLike) -> ArrayLike:
         """Return density-dependent proliferation minus treatment-mediated loss."""
