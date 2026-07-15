@@ -49,6 +49,7 @@ class PINNCohortConfig:
     manifest_path: Path
     nifti_root: Path
     output_root: Path
+    data_root: Path = Path(".")
     role: str = "training"
     device: str = "auto"
     downsample: int = 1
@@ -190,8 +191,9 @@ def _run_transition(
     patient_id = transition["patient_id"]
     ds = config.downsample
 
-    source_image = nib.as_closest_canonical(nib.load(transition["source_segmentation"]))
-    target_image = nib.as_closest_canonical(nib.load(transition["target_segmentation"]))
+    root = config.data_root
+    source_image = nib.as_closest_canonical(nib.load(root / transition["source_segmentation"]))
+    target_image = nib.as_closest_canonical(nib.load(root / transition["target_segmentation"]))
     source_labels = np.rint(np.asanyarray(source_image.dataobj)).astype(np.int16)
     target_labels = np.rint(np.asanyarray(target_image.dataobj)).astype(np.int16)
 
@@ -219,7 +221,7 @@ def _run_transition(
     horizon_days = target_day - source_day
 
     if history_available and transition.get("previous_segmentation"):
-        prev_image = nib.as_closest_canonical(nib.load(transition["previous_segmentation"]))
+        prev_image = nib.as_closest_canonical(nib.load(root / transition["previous_segmentation"]))
         prev_labels = np.rint(np.asanyarray(prev_image.dataobj)).astype(np.int16)
         if ds > 1:
             prev_labels = prev_labels[::ds, ::ds, ::ds]
