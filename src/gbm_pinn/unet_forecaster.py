@@ -61,7 +61,7 @@ class UNet3D(nn.Module):
     Output: single channel predicted density change (residual from source).
     """
 
-    def __init__(self, in_channels: int = 6, base_filters: int = 16) -> None:
+    def __init__(self, in_channels: int = 6, base_filters: int = 8, dropout: float = 0.3) -> None:
         super().__init__()
         f = base_filters
 
@@ -71,7 +71,7 @@ class UNet3D(nn.Module):
         self.enc4 = ConvBlock(f * 4, f * 8)
 
         self.pool = nn.MaxPool3d(2)
-        self.dropout = nn.Dropout3d(0.1)
+        self.dropout = nn.Dropout3d(dropout)
 
         self.up3 = nn.ConvTranspose3d(f * 8, f * 4, 2, stride=2)
         self.dec3 = ConvBlock(f * 8, f * 4)
@@ -90,11 +90,11 @@ class UNet3D(nn.Module):
 
         d3 = self.up3(e4)
         d3 = self._pad_and_cat(d3, e3)
-        d3 = self.dec3(d3)
+        d3 = self.dec3(self.dropout(d3))
 
         d2 = self.up2(d3)
         d2 = self._pad_and_cat(d2, e2)
-        d2 = self.dec2(d2)
+        d2 = self.dec2(self.dropout(d2))
 
         d1 = self.up1(d2)
         d1 = self._pad_and_cat(d1, e1)
@@ -127,12 +127,14 @@ class TumorTransitionDataset(Dataset):
         downsample: int = 2,
         target_shape: tuple[int, int, int] = (120, 120, 80),
         infiltrative_density: float = 0.3,
+        augment: bool = False,
     ) -> None:
         self.transitions = transitions
         self.data_root = data_root
         self.downsample = downsample
         self.target_shape = target_shape
         self.infiltrative_density = infiltrative_density
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.transitions)
@@ -202,6 +204,13 @@ class TumorTransitionDataset(Dataset):
         target_tensor = torch.from_numpy(target_density[np.newaxis])
         source_tensor = torch.from_numpy(source_density[np.newaxis])
 
+        if self.augment:
+            for dim in range(3):
+                if np.random.random() > 0.5:
+                    input_tensor = torch.flip(input_tensor, [dim + 1])
+                    target_tensor = torch.flip(target_tensor, [dim + 1])
+                    source_tensor = torch.flip(source_tensor, [dim + 1])
+
         return {
             "input": input_tensor,
             "target": target_tensor,
@@ -231,17 +240,14 @@ def physics_loss(
 ) -> torch.Tensor:
     """Reaction-diffusion PDE residual as a soft constraint.
 
-    Approximates ∂u/∂t ≈ (prediction - source) / horizon
-    and checks consistency with D·∇²u + ρ·u·(1-u).
-
-    Uses the predicted field to compute the spatial Laplacian,
-    then penalizes deviations from the PDE.
+    Computes the PDE in normalized time (years) so the residual has
+    magnitude comparable to the data loss.
     """
     batch_size = prediction.shape[0]
     u = prediction
-    dt = horizon_days.view(batch_size, 1, 1, 1, 1).clamp(min=1.0)
+    dt_years = (horizon_days / 365.0).view(batch_size, 1, 1, 1, 1).clamp(min=1.0 / 365.0)
 
-    du_dt = (u - source) / dt
+    du_dt = (u - source) / dt_years
 
     laplacian = torch.zeros_like(u)
     for dim in range(3):
@@ -251,11 +257,14 @@ def physics_loss(
             - 2.0 * u
         ) / (spacing ** 2)
 
-    d_mean = 0.02
-    rho_mean = 0.004
-    reaction = rho_mean * u * (1.0 - u)
-    pde_residual = du_dt - d_mean * laplacian - reaction
+    D = 0.02
+    rho = 0.004
+    reaction = rho * u * (1.0 - u)
+    pde_residual = du_dt - D * laplacian - reaction
 
+    tumor_mask = (u > 0.05) | (source > 0.05)
+    if tumor_mask.any():
+        return torch.mean(pde_residual[tumor_mask] ** 2)
     return torch.mean(pde_residual ** 2)
 
 
@@ -272,11 +281,13 @@ class TrainConfig:
     output_root: Path = Path("outputs/unet_pinn")
     downsample: int = 2
     target_shape: tuple[int, int, int] = (120, 120, 80)
-    base_filters: int = 16
+    base_filters: int = 8
+    dropout: float = 0.3
     epochs: int = 100
     batch_size: int = 2
-    learning_rate: float = 1e-3
-    physics_weight: float = 0.1
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-3
+    physics_weight: float = 1.0
     infiltrative_density: float = 0.3
     threshold: float = 0.1
     device: str = "auto"
@@ -318,12 +329,14 @@ def train(config: TrainConfig) -> dict[str, Any]:
         downsample=config.downsample,
         target_shape=config.target_shape,
         infiltrative_density=config.infiltrative_density,
+        augment=True,
     )
     val_dataset = TumorTransitionDataset(
         val_transitions, config.data_root,
         downsample=config.downsample,
         target_shape=config.target_shape,
         infiltrative_density=config.infiltrative_density,
+        augment=False,
     )
 
     train_loader = DataLoader(
@@ -335,12 +348,14 @@ def train(config: TrainConfig) -> dict[str, Any]:
         num_workers=config.num_workers,
     )
 
-    model = UNet3D(in_channels=6, base_filters=config.base_filters).to(device)
+    model = UNet3D(
+        in_channels=6, base_filters=config.base_filters, dropout=config.dropout,
+    ).to(device)
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {param_count:,}", flush=True)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=1e-4,
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs,
@@ -386,7 +401,7 @@ def train(config: TrainConfig) -> dict[str, Any]:
         avg_data = epoch_data_loss / max(n_batches, 1)
         avg_phys = epoch_phys_loss / max(n_batches, 1)
 
-        if epoch % 5 == 0 or epoch == 1:
+        if epoch % 2 == 0 or epoch == 1:
             val_results = evaluate(model, val_loader, device, config)
             skill = val_results["mean_skill"]
             beating = val_results["n_beating_persistence"]
