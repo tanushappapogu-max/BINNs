@@ -281,7 +281,7 @@ class TrainConfig:
     output_root: Path = Path("outputs/unet_pinn")
     downsample: int = 2
     target_shape: tuple[int, int, int] = (120, 120, 80)
-    base_filters: int = 8
+    base_filters: int = 16
     dropout: float = 0.3
     epochs: int = 100
     batch_size: int = 2
