@@ -285,9 +285,9 @@ class TrainConfig:
     dropout: float = 0.3
     epochs: int = 100
     batch_size: int = 2
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-3
-    physics_weight: float = 1.0
+    physics_weight: float = 0.01
     infiltrative_density: float = 0.3
     threshold: float = 0.1
     device: str = "auto"
@@ -380,7 +380,13 @@ def train(config: TrainConfig) -> dict[str, Any]:
             predicted = source + residual
             predicted = predicted.clamp(0.0, 1.0)
 
-            data_loss = F.mse_loss(predicted, target)
+            tumor_mask = (source > 0.05) | (target > 0.05)
+            if tumor_mask.any():
+                tumor_weight = torch.ones_like(predicted)
+                tumor_weight[tumor_mask] = 10.0
+                data_loss = (tumor_weight * (predicted - target) ** 2).mean()
+            else:
+                data_loss = F.mse_loss(predicted, target)
             phys_loss = physics_loss(
                 predicted, source, horizon,
                 spacing=float(config.downsample),
