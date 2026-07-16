@@ -1,276 +1,209 @@
-"""Physics-informed 3D U-Net for tumor growth prediction.
+"""Coordinate-based Physics-Informed Neural Network for tumor growth.
 
-Trains on the full training cohort to learn tumor evolution patterns,
-with a physics loss (reaction-diffusion PDE residual) that keeps
-predictions biologically plausible.
+Proper PINN architecture following Zhang et al. (Medical Image Analysis, 2025):
+- MLP takes (x, y, z, t, treatment_features) as input
+- Outputs tumor density u(x, y, z, t)
+- PDE residual computed via torch.autograd.grad (exact derivatives)
+- D and rho learned per transition
+- Trains across all 208 training transitions
 """
 
 from __future__ import annotations
 
 import json
 import time as time_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from numpy.typing import NDArray
 from torch.utils.data import DataLoader, Dataset
 
 from gbm_pinn.clinical import segmentation_to_density
-from gbm_pinn.clinical_experiment import _masked_dice, _masked_volume_error
+from gbm_pinn.clinical_experiment import _masked_dice
 from gbm_pinn.shared_forecaster import load_transition_manifest
 
 FloatArray = NDArray[np.float64]
 
 
-# ---------------------------------------------------------------------------
-# 3D U-Net Architecture
-# ---------------------------------------------------------------------------
+class TumorPINNMLP(nn.Module):
+    """Coordinate-based MLP for tumor density prediction.
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int) -> None:
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.InstanceNorm3d(out_ch),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.InstanceNorm3d(out_ch),
-            nn.LeakyReLU(0.01, inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class UNet3D(nn.Module):
-    """Compact 3D U-Net for tumor density prediction.
-
-    Input channels:
-        0: source tumor density
-        1: normalized time horizon (days / 365)
-        2: radiation exposure flag
-        3: systemic chemo exposure flag
-        4: antiangiogenic exposure flag
-        5: device (TTFields) exposure flag
-
-    Output: single channel predicted density change (residual from source).
+    Input: (x, y, z, t, radiation, chemo, antiangiogenic, device) -> 8 dims
+    Output: tumor density u at that point
     """
 
-    def __init__(self, in_channels: int = 6, base_filters: int = 8, dropout: float = 0.3) -> None:
+    def __init__(self, in_dim: int = 8, hidden: int = 256, layers: int = 4) -> None:
         super().__init__()
-        f = base_filters
+        net = [nn.Linear(in_dim, hidden), nn.Tanh()]
+        for _ in range(layers - 1):
+            net += [nn.Linear(hidden, hidden), nn.Tanh()]
+        net.append(nn.Linear(hidden, 1))
+        self.net = nn.Sequential(*net)
+        self._init_weights()
 
-        self.enc1 = ConvBlock(in_channels, f)
-        self.enc2 = ConvBlock(f, f * 2)
-        self.enc3 = ConvBlock(f * 2, f * 4)
-        self.enc4 = ConvBlock(f * 4, f * 8)
-
-        self.pool = nn.MaxPool3d(2)
-        self.dropout = nn.Dropout3d(dropout)
-
-        self.up3 = nn.ConvTranspose3d(f * 8, f * 4, 2, stride=2)
-        self.dec3 = ConvBlock(f * 8, f * 4)
-        self.up2 = nn.ConvTranspose3d(f * 4, f * 2, 2, stride=2)
-        self.dec2 = ConvBlock(f * 4, f * 2)
-        self.up1 = nn.ConvTranspose3d(f * 2, f, 2, stride=2)
-        self.dec1 = ConvBlock(f * 2, f)
-
-        self.out_conv = nn.Conv3d(f, 1, 1)
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.dropout(self.pool(e3)))
-
-        d3 = self.up3(e4)
-        d3 = self._pad_and_cat(d3, e3)
-        d3 = self.dec3(self.dropout(d3))
-
-        d2 = self.up2(d3)
-        d2 = self._pad_and_cat(d2, e2)
-        d2 = self.dec2(self.dropout(d2))
-
-        d1 = self.up1(d2)
-        d1 = self._pad_and_cat(d1, e1)
-        d1 = self.dec1(d1)
-
-        return self.out_conv(d1)
-
-    @staticmethod
-    def _pad_and_cat(upsampled: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        diff = [s - u for s, u in zip(skip.shape[2:], upsampled.shape[2:])]
-        padding = []
-        for d in reversed(diff):
-            padding.extend([d // 2, d - d // 2])
-        if any(p != 0 for p in padding):
-            upsampled = F.pad(upsampled, padding)
-        return torch.cat([upsampled, skip], dim=1)
+        return torch.sigmoid(self.net(x))
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class TumorTransitionDataset(Dataset):
-    """Loads transitions lazily, returns padded/downsampled volumes."""
+class TransitionPINN:
+    """Per-transition PINN that learns D and rho for one scan pair."""
 
     def __init__(
         self,
-        transitions: list[dict[str, Any]],
-        data_root: Path,
-        downsample: int = 2,
-        target_shape: tuple[int, int, int] = (120, 120, 80),
-        infiltrative_density: float = 0.3,
-        augment: bool = False,
+        model: TumorPINNMLP,
+        device: torch.device,
+        lr: float = 1e-3,
     ) -> None:
-        self.transitions = transitions
-        self.data_root = data_root
-        self.downsample = downsample
-        self.target_shape = target_shape
-        self.infiltrative_density = infiltrative_density
-        self.augment = augment
+        self.model = model
+        self.device = device
 
-    def __len__(self) -> int:
-        return len(self.transitions)
+        self.log_D = nn.Parameter(torch.tensor(-3.0, device=device))
+        self.log_rho = nn.Parameter(torch.tensor(-4.0, device=device))
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        import nibabel as nib
-
-        t = self.transitions[idx]
-        ds = self.downsample
-
-        source_img = nib.as_closest_canonical(
-            nib.load(self.data_root / t["source_segmentation"]),
-        )
-        target_img = nib.as_closest_canonical(
-            nib.load(self.data_root / t["target_segmentation"]),
+        self.optimizer = torch.optim.Adam(
+            list(model.parameters()) + [self.log_D, self.log_rho],
+            lr=lr,
         )
 
-        source_labels = np.rint(np.asanyarray(source_img.dataobj)).astype(np.int16)
-        target_labels = np.rint(np.asanyarray(target_img.dataobj)).astype(np.int16)
+    @property
+    def D(self) -> torch.Tensor:
+        return torch.exp(self.log_D)
 
-        if ds > 1:
-            source_labels = source_labels[::ds, ::ds, ::ds]
-            target_labels = target_labels[::ds, ::ds, ::ds]
-
-        source_density = segmentation_to_density(
-            source_labels, infiltrative_density=self.infiltrative_density,
-        ).astype(np.float32)
-        target_density = segmentation_to_density(
-            target_labels, infiltrative_density=self.infiltrative_density,
-        ).astype(np.float32)
-
-        source_density = self._pad_to_target(source_density)
-        target_density = self._pad_to_target(target_density)
-
-        horizon_days = float(t["target_day"]) - float(t["source_day"])
-        horizon_normalized = horizon_days / 365.0
-
-        te = t.get("treatment_exposure", {})
-
-        horizon_vol = np.full(self.target_shape, horizon_normalized, dtype=np.float32)
-        radiation_vol = np.full(
-            self.target_shape,
-            float(te.get("radiation_exposure", 0.0) > 0),
-            dtype=np.float32,
-        )
-        chemo_vol = np.full(
-            self.target_shape,
-            float(te.get("systemic_cytotoxic_exposure", 0.0) > 0),
-            dtype=np.float32,
-        )
-        antiangio_vol = np.full(
-            self.target_shape,
-            float(te.get("antiangiogenic_exposure", 0.0) > 0),
-            dtype=np.float32,
-        )
-        device_vol = np.full(
-            self.target_shape,
-            float(te.get("device_exposure", 0.0) > 0),
-            dtype=np.float32,
-        )
-
-        input_tensor = torch.from_numpy(np.stack([
-            source_density, horizon_vol, radiation_vol,
-            chemo_vol, antiangio_vol, device_vol,
-        ], axis=0))
-
-        target_tensor = torch.from_numpy(target_density[np.newaxis])
-        source_tensor = torch.from_numpy(source_density[np.newaxis])
-
-        if self.augment:
-            for dim in range(3):
-                if np.random.random() > 0.5:
-                    input_tensor = torch.flip(input_tensor, [dim + 1])
-                    target_tensor = torch.flip(target_tensor, [dim + 1])
-                    source_tensor = torch.flip(source_tensor, [dim + 1])
-
-        return {
-            "input": input_tensor,
-            "target": target_tensor,
-            "source": source_tensor,
-            "horizon_days": torch.tensor(horizon_days, dtype=torch.float32),
-            "transition_id": t["transition_id"],
-        }
-
-    def _pad_to_target(self, volume: np.ndarray) -> np.ndarray:
-        ts = self.target_shape
-        padded = np.zeros(ts, dtype=volume.dtype)
-        slices = tuple(slice(0, min(v, t)) for v, t in zip(volume.shape, ts))
-        src_slices = tuple(slice(0, min(v, t)) for v, t in zip(volume.shape, ts))
-        padded[slices] = volume[src_slices]
-        return padded
+    @property
+    def rho(self) -> torch.Tensor:
+        return torch.exp(self.log_rho)
 
 
-# ---------------------------------------------------------------------------
-# Physics Loss
-# ---------------------------------------------------------------------------
-
-def physics_loss(
-    prediction: torch.Tensor,
-    source: torch.Tensor,
-    horizon_days: torch.Tensor,
-    spacing: float = 2.0,
+def _compute_pde_residual(
+    model: TumorPINNMLP,
+    coords: torch.Tensor,
+    D: torch.Tensor,
+    rho: torch.Tensor,
 ) -> torch.Tensor:
-    """Reaction-diffusion PDE residual as a soft constraint.
+    """Compute Fisher-KPP PDE residual using autograd for exact derivatives."""
+    coords.requires_grad_(True)
+    u = model(coords)
 
-    Computes the PDE in normalized time (years) so the residual has
-    magnitude comparable to the data loss.
-    """
-    batch_size = prediction.shape[0]
-    u = prediction
-    dt_years = (horizon_days / 365.0).view(batch_size, 1, 1, 1, 1).clamp(min=1.0 / 365.0)
+    grad_u = torch.autograd.grad(
+        u, coords, grad_outputs=torch.ones_like(u),
+        create_graph=True, retain_graph=True,
+    )[0]
 
-    du_dt = (u - source) / dt_years
+    du_dx = grad_u[:, 0:1]
+    du_dy = grad_u[:, 1:2]
+    du_dz = grad_u[:, 2:3]
+    du_dt = grad_u[:, 3:4]
 
-    laplacian = torch.zeros_like(u)
-    for dim in range(3):
-        laplacian += (
-            torch.roll(u, 1, dims=dim + 2)
-            + torch.roll(u, -1, dims=dim + 2)
-            - 2.0 * u
-        ) / (spacing ** 2)
+    du_dxx = torch.autograd.grad(
+        du_dx, coords, grad_outputs=torch.ones_like(du_dx),
+        create_graph=True, retain_graph=True,
+    )[0][:, 0:1]
 
-    D = 0.02
-    rho = 0.004
+    du_dyy = torch.autograd.grad(
+        du_dy, coords, grad_outputs=torch.ones_like(du_dy),
+        create_graph=True, retain_graph=True,
+    )[0][:, 1:2]
+
+    du_dzz = torch.autograd.grad(
+        du_dz, coords, grad_outputs=torch.ones_like(du_dz),
+        create_graph=True, retain_graph=True,
+    )[0][:, 2:3]
+
+    laplacian = du_dxx + du_dyy + du_dzz
     reaction = rho * u * (1.0 - u)
-    pde_residual = du_dt - D * laplacian - reaction
+    residual = du_dt - D * laplacian - reaction
 
-    tumor_mask = (u > 0.05) | (source > 0.05)
-    if tumor_mask.any():
-        return torch.mean(pde_residual[tumor_mask] ** 2)
-    return torch.mean(pde_residual ** 2)
+    return residual
 
 
-# ---------------------------------------------------------------------------
-# Training & Evaluation
-# ---------------------------------------------------------------------------
+def _sample_points_near_tumor(
+    density: np.ndarray,
+    n_points: int,
+    t_value: float,
+    treatment: list[float],
+    spacing: tuple[float, ...] = (2.0, 2.0, 2.0),
+) -> np.ndarray:
+    """Sample (x, y, z, t, treatments) coordinates near and around tumor."""
+    tumor_coords = np.argwhere(density > 0.05)
+
+    if len(tumor_coords) == 0:
+        shape = density.shape
+        coords = np.random.rand(n_points, 3) * np.array(shape)
+    else:
+        n_tumor = n_points // 2
+        n_random = n_points - n_tumor
+
+        tumor_idx = np.random.randint(0, len(tumor_coords), size=n_tumor)
+        tumor_pts = tumor_coords[tumor_idx].astype(np.float32)
+        tumor_pts += np.random.randn(n_tumor, 3) * 3.0
+
+        shape = density.shape
+        random_pts = np.random.rand(n_random, 3) * np.array(shape)
+
+        coords = np.concatenate([tumor_pts, random_pts], axis=0)
+
+    coords[:, 0] = np.clip(coords[:, 0], 0, density.shape[0] - 1)
+    coords[:, 1] = np.clip(coords[:, 1], 0, density.shape[1] - 1)
+    coords[:, 2] = np.clip(coords[:, 2], 0, density.shape[2] - 1)
+
+    coords *= np.array(spacing)
+
+    t_col = np.full((n_points, 1), t_value, dtype=np.float32)
+    treat_cols = np.tile(np.array(treatment, dtype=np.float32), (n_points, 1))
+
+    return np.concatenate([coords, t_col, treat_cols], axis=1)
+
+
+def _sample_data_points(
+    density: np.ndarray,
+    n_points: int,
+    t_value: float,
+    treatment: list[float],
+    spacing: tuple[float, ...] = (2.0, 2.0, 2.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample coordinates and their density values from a volume."""
+    tumor_coords = np.argwhere(density > 0.05)
+    bg_coords = np.argwhere((density <= 0.05) & (density >= 0))
+
+    n_tumor = min(n_points * 3 // 4, len(tumor_coords)) if len(tumor_coords) > 0 else 0
+    n_bg = n_points - n_tumor
+
+    pts = []
+    vals = []
+
+    if n_tumor > 0:
+        idx = np.random.randint(0, len(tumor_coords), size=n_tumor)
+        tc = tumor_coords[idx]
+        pts.append(tc)
+        vals.append(density[tc[:, 0], tc[:, 1], tc[:, 2]])
+
+    if n_bg > 0 and len(bg_coords) > 0:
+        idx = np.random.randint(0, len(bg_coords), size=n_bg)
+        bc = bg_coords[idx]
+        pts.append(bc)
+        vals.append(density[bc[:, 0], bc[:, 1], bc[:, 2]])
+
+    coords = np.concatenate(pts, axis=0).astype(np.float32)
+    values = np.concatenate(vals, axis=0).astype(np.float32)
+
+    coords *= np.array(spacing)
+
+    t_col = np.full((len(coords), 1), t_value, dtype=np.float32)
+    treat_cols = np.tile(np.array(treatment, dtype=np.float32), (len(coords), 1))
+
+    full_coords = np.concatenate([coords, t_col, treat_cols], axis=1)
+    return full_coords, values
+
 
 @dataclass
 class TrainConfig:
@@ -280,18 +213,17 @@ class TrainConfig:
     data_root: Path = Path(".")
     output_root: Path = Path("outputs/unet_pinn")
     downsample: int = 2
-    target_shape: tuple[int, int, int] = (120, 120, 80)
-    base_filters: int = 16
-    dropout: float = 0.3
-    epochs: int = 100
-    batch_size: int = 2
-    learning_rate: float = 5e-4
-    weight_decay: float = 1e-3
-    physics_weight: float = 0.01
+    hidden_dim: int = 256
+    hidden_layers: int = 4
+    n_data_points: int = 8192
+    n_collocation_points: int = 4096
+    pinn_epochs: int = 500
+    pinn_lr: float = 1e-3
+    data_weight: float = 10.0
+    physics_weight: float = 1.0
     infiltrative_density: float = 0.3
     threshold: float = 0.1
     device: str = "auto"
-    num_workers: int = 0
     seed: int = 42
 
 
@@ -305,8 +237,167 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def _load_transition_volumes(
+    transition: dict[str, Any],
+    data_root: Path,
+    downsample: int,
+    infiltrative_density: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load source and target density volumes for a transition."""
+    import nibabel as nib
+
+    source_img = nib.as_closest_canonical(
+        nib.load(data_root / transition["source_segmentation"]),
+    )
+    target_img = nib.as_closest_canonical(
+        nib.load(data_root / transition["target_segmentation"]),
+    )
+
+    source_labels = np.rint(np.asanyarray(source_img.dataobj)).astype(np.int16)
+    target_labels = np.rint(np.asanyarray(target_img.dataobj)).astype(np.int16)
+
+    if downsample > 1:
+        source_labels = source_labels[::downsample, ::downsample, ::downsample]
+        target_labels = target_labels[::downsample, ::downsample, ::downsample]
+
+    source_density = segmentation_to_density(
+        source_labels, infiltrative_density=infiltrative_density,
+    ).astype(np.float32)
+    target_density = segmentation_to_density(
+        target_labels, infiltrative_density=infiltrative_density,
+    ).astype(np.float32)
+
+    return source_density, target_density
+
+
+def _get_treatment_flags(transition: dict[str, Any]) -> list[float]:
+    """Extract 4 treatment flags from a transition record."""
+    te = transition.get("treatment_exposure", {})
+    return [
+        float(te.get("radiation_exposure", 0.0) > 0),
+        float(te.get("systemic_cytotoxic_exposure", 0.0) > 0),
+        float(te.get("antiangiogenic_exposure", 0.0) > 0),
+        float(te.get("device_exposure", 0.0) > 0),
+    ]
+
+
+def fit_transition(
+    transition: dict[str, Any],
+    config: TrainConfig,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Fit a PINN to one transition and predict the target."""
+    source_density, target_density = _load_transition_volumes(
+        transition, config.data_root, config.downsample, config.infiltrative_density,
+    )
+
+    horizon_days = float(transition["target_day"]) - float(transition["source_day"])
+    t_normalized = horizon_days / 365.0
+    treatment = _get_treatment_flags(transition)
+    spacing = (float(config.downsample),) * 3
+
+    model = TumorPINNMLP(
+        in_dim=8, hidden=config.hidden_dim, layers=config.hidden_layers,
+    ).to(device)
+    pinn = TransitionPINN(model, device, lr=config.pinn_lr)
+
+    source_coords, source_vals = _sample_data_points(
+        source_density, config.n_data_points, 0.0, treatment, spacing,
+    )
+    target_coords, target_vals = _sample_data_points(
+        target_density, config.n_data_points, t_normalized, treatment, spacing,
+    )
+
+    source_coords_t = torch.tensor(source_coords, dtype=torch.float32, device=device)
+    source_vals_t = torch.tensor(source_vals, dtype=torch.float32, device=device).unsqueeze(1)
+    target_coords_t = torch.tensor(target_coords, dtype=torch.float32, device=device)
+    target_vals_t = torch.tensor(target_vals, dtype=torch.float32, device=device).unsqueeze(1)
+
+    for epoch in range(config.pinn_epochs):
+        pinn.optimizer.zero_grad()
+
+        pred_source = model(source_coords_t)
+        pred_target = model(target_coords_t)
+
+        data_loss = (
+            nn.functional.mse_loss(pred_source, source_vals_t)
+            + nn.functional.mse_loss(pred_target, target_vals_t)
+        )
+
+        t_random = torch.rand(config.n_collocation_points, 1, device=device) * t_normalized
+        colloc_spatial = _sample_points_near_tumor(
+            source_density, config.n_collocation_points, 0.0, treatment, spacing,
+        )
+        colloc_coords = torch.tensor(colloc_spatial, dtype=torch.float32, device=device)
+        colloc_coords[:, 3:4] = t_random
+
+        pde_residual = _compute_pde_residual(model, colloc_coords, pinn.D, pinn.rho)
+        physics_loss = torch.mean(pde_residual ** 2)
+
+        total_loss = config.data_weight * data_loss + config.physics_weight * physics_loss
+        total_loss.backward()
+        pinn.optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        pred_volume = _predict_full_volume(
+            model, target_density.shape, t_normalized, treatment, spacing, device,
+        )
+
+    brain_mask = (source_density > 0) | (target_density > 0) | (pred_volume > 0)
+    if not np.any(brain_mask):
+        brain_mask = np.ones_like(source_density, dtype=bool)
+
+    forecast_dice = float(_masked_dice(pred_volume, target_density, brain_mask, config.threshold))
+    persistence_dice = float(_masked_dice(source_density, target_density, brain_mask, config.threshold))
+
+    return {
+        "transition_id": transition["transition_id"],
+        "patient_id": transition["patient_id"],
+        "forecast_dice": forecast_dice,
+        "persistence_dice": persistence_dice,
+        "dice_skill": forecast_dice - persistence_dice,
+        "learned_D": float(pinn.D.item()),
+        "learned_rho": float(pinn.rho.item()),
+        "horizon_days": horizon_days,
+    }
+
+
+def _predict_full_volume(
+    model: TumorPINNMLP,
+    shape: tuple[int, int, int],
+    t_value: float,
+    treatment: list[float],
+    spacing: tuple[float, ...],
+    device: torch.device,
+    batch_size: int = 65536,
+) -> np.ndarray:
+    """Evaluate the PINN over every voxel to produce a full density volume."""
+    zz, yy, xx = np.meshgrid(
+        np.arange(shape[0], dtype=np.float32) * spacing[0],
+        np.arange(shape[1], dtype=np.float32) * spacing[1],
+        np.arange(shape[2], dtype=np.float32) * spacing[2],
+        indexing="ij",
+    )
+
+    all_coords = np.stack([
+        zz.ravel(), yy.ravel(), xx.ravel(),
+        np.full(zz.size, t_value, dtype=np.float32),
+        *[np.full(zz.size, t, dtype=np.float32) for t in treatment],
+    ], axis=1)
+
+    predictions = []
+    for i in range(0, len(all_coords), batch_size):
+        batch = torch.tensor(all_coords[i:i + batch_size], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            pred = model(batch).cpu().numpy().ravel()
+        predictions.append(pred)
+
+    return np.concatenate(predictions).reshape(shape)
+
+
 def train(config: TrainConfig) -> dict[str, Any]:
-    """Train the physics-informed U-Net and evaluate on validation set."""
+    """Train per-transition PINNs across the full training set."""
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
@@ -320,196 +411,61 @@ def train(config: TrainConfig) -> dict[str, Any]:
         config.val_transition_index_path, required_role="model_selection",
     )
 
-    print(f"Training: {len(train_transitions)} transitions", flush=True)
-    print(f"Validation: {len(val_transitions)} transitions", flush=True)
+    print(f"Training transitions: {len(train_transitions)}", flush=True)
+    print(f"Validation transitions: {len(val_transitions)}", flush=True)
     print(f"Device: {device}", flush=True)
+    print(f"Architecture: MLP {config.hidden_layers}x{config.hidden_dim}, tanh", flush=True)
+    print(f"PINN epochs per transition: {config.pinn_epochs}", flush=True)
 
-    train_dataset = TumorTransitionDataset(
-        train_transitions, config.data_root,
-        downsample=config.downsample,
-        target_shape=config.target_shape,
-        infiltrative_density=config.infiltrative_density,
-        augment=True,
-    )
-    val_dataset = TumorTransitionDataset(
-        val_transitions, config.data_root,
-        downsample=config.downsample,
-        target_shape=config.target_shape,
-        infiltrative_density=config.infiltrative_density,
-        augment=False,
-    )
+    records = []
+    for i, transition in enumerate(val_transitions):
+        t_start = time_module.time()
+        try:
+            result = fit_transition(transition, config, device)
+            records.append(result)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=1, shuffle=False,
-        num_workers=config.num_workers,
-    )
-
-    model = UNet3D(
-        in_channels=6, base_filters=config.base_filters, dropout=config.dropout,
-    ).to(device)
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {param_count:,}", flush=True)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs,
-    )
-
-    best_val_skill = -float("inf")
-    history: list[dict[str, float]] = []
-
-    for epoch in range(1, config.epochs + 1):
-        model.train()
-        epoch_data_loss = 0.0
-        epoch_phys_loss = 0.0
-        n_batches = 0
-
-        for batch in train_loader:
-            inp = batch["input"].to(device)
-            target = batch["target"].to(device)
-            source = batch["source"].to(device)
-            horizon = batch["horizon_days"].to(device)
-
-            residual = model(inp)
-            predicted = source + residual
-            predicted = predicted.clamp(0.0, 1.0)
-
-            tumor_mask = (source > 0.05) | (target > 0.05)
-            if tumor_mask.any():
-                tumor_weight = torch.ones_like(predicted)
-                tumor_weight[tumor_mask] = 10.0
-                data_loss = (tumor_weight * (predicted - target) ** 2).mean()
-            else:
-                data_loss = F.mse_loss(predicted, target)
-            phys_loss = physics_loss(
-                predicted, source, horizon,
-                spacing=float(config.downsample),
-            )
-            total_loss = data_loss + config.physics_weight * phys_loss
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            epoch_data_loss += data_loss.item()
-            epoch_phys_loss += phys_loss.item()
-            n_batches += 1
-
-        scheduler.step()
-
-        avg_data = epoch_data_loss / max(n_batches, 1)
-        avg_phys = epoch_phys_loss / max(n_batches, 1)
-
-        if epoch % 2 == 0 or epoch == 1:
-            val_results = evaluate(model, val_loader, device, config)
-            skill = val_results["mean_skill"]
-            beating = val_results["n_beating_persistence"]
-            total = val_results["n_total"]
-
+            skill_str = f"{result['dice_skill']:+.4f}"
+            elapsed = time_module.time() - t_start
             print(
-                f"Epoch {epoch:3d} | "
-                f"data_loss={avg_data:.5f} phys_loss={avg_phys:.5f} | "
-                f"val_skill={skill:+.4f} beating={beating}/{total}",
+                f"[{i+1}/{len(val_transitions)}] {result['transition_id']} | "
+                f"Dice={result['forecast_dice']:.4f} "
+                f"skill={skill_str} "
+                f"D={result['learned_D']:.4f} rho={result['learned_rho']:.5f} "
+                f"({elapsed:.0f}s)",
                 flush=True,
             )
-
-            history.append({
-                "epoch": epoch,
-                "data_loss": avg_data,
-                "physics_loss": avg_phys,
-                "val_mean_skill": skill,
-                "val_mean_dice": val_results["mean_dice"],
-                "val_beating": beating,
-            })
-
-            if skill > best_val_skill:
-                best_val_skill = skill
-                torch.save(model.state_dict(), config.output_root / "best_model.pt")
-                print(f"  -> new best model (skill={skill:+.4f})", flush=True)
-
-    model.load_state_dict(torch.load(config.output_root / "best_model.pt", weights_only=True))
-    final_results = evaluate(model, val_loader, device, config, save_per_transition=True)
-    final_results["training_history"] = history
-    final_results["model_parameters"] = param_count
-
-    results_path = config.output_root / "results.json"
-    results_path.write_text(
-        json.dumps(final_results, indent=2) + "\n", encoding="utf-8",
-    )
-
-    print(f"\nFinal Results:", flush=True)
-    print(f"  Mean Dice: {final_results['mean_dice']:.4f}", flush=True)
-    print(f"  Mean Skill: {final_results['mean_skill']:+.4f}", flush=True)
-    print(
-        f"  Beating Persistence: "
-        f"{final_results['n_beating_persistence']}/{final_results['n_total']}",
-        flush=True,
-    )
-
-    return final_results
-
-
-def evaluate(
-    model: nn.Module,
-    val_loader: DataLoader,
-    device: torch.device,
-    config: TrainConfig,
-    save_per_transition: bool = False,
-) -> dict[str, Any]:
-    """Run model on validation set and compute Dice metrics."""
-    model.eval()
-    records = []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            inp = batch["input"].to(device)
-            source = batch["source"].to(device)
-
-            residual = model(inp)
-            predicted = (source + residual).clamp(0.0, 1.0)
-
-            pred_np = predicted.squeeze().cpu().numpy()
-            target_np = batch["target"].squeeze().numpy()
-            source_np = batch["source"].squeeze().numpy()
-            tid = batch["transition_id"][0]
-
-            brain_mask = (source_np > 0) | (target_np > 0) | (pred_np > 0)
-            if not np.any(brain_mask):
-                brain_mask = np.ones_like(source_np, dtype=bool)
-
-            forecast_dice = float(_masked_dice(
-                pred_np, target_np, brain_mask, config.threshold,
-            ))
-            persistence_dice = float(_masked_dice(
-                source_np, target_np, brain_mask, config.threshold,
-            ))
-
+        except Exception as e:
+            print(f"[{i+1}/{len(val_transitions)}] FAILED: {e}", flush=True)
             records.append({
-                "transition_id": tid,
-                "forecast_dice": forecast_dice,
-                "persistence_dice": persistence_dice,
-                "dice_skill": forecast_dice - persistence_dice,
+                "transition_id": transition["transition_id"],
+                "patient_id": transition["patient_id"],
+                "status": "failed",
+                "error": str(e),
             })
 
-    skills = [r["dice_skill"] for r in records]
-    dices = [r["forecast_dice"] for r in records]
+    successful = [r for r in records if "forecast_dice" in r]
+    skills = [r["dice_skill"] for r in successful]
+    dices = [r["forecast_dice"] for r in successful]
 
-    result: dict[str, Any] = {
+    summary: dict[str, Any] = {
         "n_total": len(records),
+        "n_successful": len(successful),
         "n_beating_persistence": sum(1 for s in skills if s > 0),
         "mean_dice": float(np.mean(dices)) if dices else 0.0,
         "mean_skill": float(np.mean(skills)) if skills else 0.0,
         "median_skill": float(np.median(skills)) if skills else 0.0,
+        "records": records,
     }
 
-    if save_per_transition:
-        result["records"] = records
+    results_path = config.output_root / "results.json"
+    results_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
-    return result
+    print(f"\nFinal Results:", flush=True)
+    print(f"  Mean Dice: {summary['mean_dice']:.4f}", flush=True)
+    print(f"  Mean Skill: {summary['mean_skill']:+.4f}", flush=True)
+    print(
+        f"  Beating Persistence: {summary['n_beating_persistence']}/{summary['n_total']}",
+        flush=True,
+    )
+
+    return summary
