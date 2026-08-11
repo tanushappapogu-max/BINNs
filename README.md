@@ -1,8 +1,19 @@
 # BINNs
 
-BINNs is a research codebase for modeling and forecasting glioblastoma growth after surgical resection. It combines biological reaction-diffusion equations with physics-informed neural networks, or PINNs.
+**Teaching a neural network the physics of tumor growth to forecast where glioblastoma returns after surgery.**
 
-The model represents tumor cells as a continuous density field that changes across space and time. It learns from early tumor observations while being constrained by equations for cell migration, proliferation, and treatment response. The system supports controlled synthetic experiments and a two-dimensional longitudinal MRI pilot.
+![License](https://img.shields.io/badge/License-MIT-brightgreen)
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
+![NumPy](https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white)
+![SciPy](https://img.shields.io/badge/SciPy-8CAAE6?logo=scipy&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-178%20passing-brightgreen)
+
+Glioblastoma returns in nearly every patient after surgery, most often within a few centimeters of where it was removed. BINNs forecasts that regrowth by pairing a biological reaction-diffusion model of tumor spread with physics-informed neural networks (PINNs), so the network learns from imaging while staying constrained by the equations of cell migration, proliferation, and treatment response.
+
+The model represents tumor cells as a continuous density field that evolves across space and time. It learns from early scans while the governing physics keeps its predictions biologically plausible. The system is validated against known synthetic ground truth and a two-dimensional longitudinal MRI pilot.
+
+_Developed by Tanush Appapogu during a research internship at HealthIntel._
 
 ## What we are building
 
@@ -252,3 +263,11 @@ uv run python scripts/run_mechanistic_forecast.py /path/to/PatientID_XXXX \
 ## Current scope
 
 The clinical runner is a research experiment, not a diagnostic or treatment-planning tool.
+
+## Authors and affiliation
+
+Developed by Tanush Appapogu during a research internship at HealthIntel.
+
+## License
+
+Released under the MIT License. Copyright (c) 2026 HealthIntel. See [LICENSE](LICENSE) for the full text.
