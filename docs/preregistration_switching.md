@@ -79,3 +79,103 @@ surgeries; excluding segments containing a zero enhancing volume; dropping
 each patient's first interval (chemoradiation and pseudoprogression period);
 null with σ halved; direction (growth or shrinkage) of each segment's largest
 interval.
+
+## Outcome of the test above
+
+Run 2026-10-13 (`outputs/surveillance/switching_test_mu.json`). Observed
+bunching 0.651 against a null mean of 0.611 (p = 0.006; type-I rate 0.045),
+significant in every secondary analysis. Power against the switching
+alternative was 0.115, so the pre-registered verdict is **inconclusive**.
+Steady growth with Gaussian noise is rejected, but the test cannot say whether
+the excess bunching comes from abrupt regime changes or from heavy-tailed
+measurement error (occasional badly segmented scans).
+
+## Amendment 1: persistence test (written before it was computed)
+
+Written 2026-10-13 after the outcome above, before any statistic in this
+amendment was computed on real data.
+
+### Idea
+
+Two explanations can each produce the observed bunching, and they make
+opposite predictions about consecutive intervals:
+
+- **Regime change** (switching): once a tumor's trajectory changes course it
+  keeps going, so consecutive radius changes tend to share a direction.
+- **Measurement outliers**: a badly segmented scan pushes the radius away and
+  the next scan snaps back, so consecutive changes tend to cancel.
+
+Each rival is calibrated to reproduce the observed bunching and residual noise
+level, then judged on a statistic it was not calibrated to.
+
+### Statistic
+
+Persistence P: the Pearson correlation of consecutive radius changes
+(Δr_k, Δr_{k+1}), pooled over all consecutive interval pairs within segments.
+Secondary: sign concordance, the mean of sign(Δr_k)·sign(Δr_{k+1}).
+
+Same data, segments and primary measure (enhancing radius) as above.
+
+### Rival models
+
+Both keep each segment's H0 fit (start radius and net change) and the observed
+scan days, and both use common random numbers during calibration.
+
+- **Outlier rival:** steady growth plus contaminated noise. Each scan's error
+  is N(0, s²) with probability 1 − π and N(0, (4s)²) with probability π.
+  Grid π ∈ {0, 0.02, …, 0.50}.
+- **Regime-change rival:** each segment is flat until τ ~ Uniform(first scan,
+  last scan), then linear, with total change equal to its H0 net change plus
+  an extra amplitude A in the same direction, and Gaussian noise N(0, s²).
+  Grid A ∈ 33 evenly spaced values from 0 to 4σ̂.
+
+Calibration: for each grid value, s is set by bisection so that the mean
+refitted pooled σ over 300 simulated cohorts equals the observed σ̂. The grid
+value whose mean simulated bunching is closest to the observed bunching is
+selected. A rival that cannot come within 0.005 of the observed bunching
+anywhere on its grid is reported as unable to reproduce the data.
+
+Each calibrated rival and H0 then generate 2000 cohorts, giving predictive
+distributions of P.
+
+### Decision rule (fixed in advance)
+
+1. **Discriminability:** the AUC separating the two rivals' P distributions
+   must be at least 0.80; otherwise the verdict is **inconclusive**.
+2. A rival is **compatible** if the observed P lies within its central 95%
+   predictive interval.
+3. Verdict:
+   - regime change compatible and outliers not: **switching favored**
+     (passes this test; criterion 2, treatment timing, comes next);
+   - outliers compatible and regime change not: **outliers favored**
+     (the switching hypothesis is dropped for MU);
+   - both compatible: **undetermined**;
+   - neither compatible: **neither rival explains MU**.
+
+Reported but not decisive: sign concordance; the same analysis on tumor-core
+radius; the one-sided H0 p-value for P in each direction.
+
+## Outcome of Amendment 1
+
+Run 2026-10-13 (`outputs/surveillance/persistence_test_mu.json`; protocol
+sha256 recorded in the output). Enhancing radius, 73 segments, 137 consecutive
+interval pairs.
+
+- Observed persistence −0.217, indistinguishable from steady growth (−0.238;
+  one-sided p = 0.39).
+- Rivals were separable (AUC 0.957). Regime change predicted −0.037
+  (95% interval −0.189 to 0.121) and is **incompatible**; outliers predicted
+  −0.248 (−0.418 to −0.054) and are compatible.
+- **Pre-registered verdict: outliers favored. The switching hypothesis is
+  dropped for MU.** Tumor core gives the same verdict.
+- Caveat stated in the protocol: the outlier rival could not reproduce the
+  observed bunching (0.617 versus 0.651), so it does not explain all of the
+  data either.
+
+Post-hoc, not pre-registered (`outputs/surveillance/persistence_posthoc_mu.json`):
+the observed persistence sits at the 1st percentile of the regime-change
+predictive distribution; heavier-tailed outliers (×6, ×8, ×12) still cannot
+reproduce the bunching; a single permanent step jump reproduces the bunching
+but not the persistence (0.4th percentile). The data combine bunched change
+with consecutive changes that cancel, consistent with large excursions that
+revert rather than with sustained regime change.

@@ -14,11 +14,12 @@ vectorized over segments and bootstrap draws. The protocol is fixed in
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.stats import rankdata
 
 FloatArray = NDArray[np.float64]
 
@@ -222,3 +223,195 @@ def rejection_rate(
         result = bunching_test(cohort.with_radius(radius), draws=draws, rng=rng)
         rejected += result.p_value < alpha
     return rejected / cohorts
+
+
+# ---------------------------------------------------------------------------
+# Persistence test: regime change versus measurement outliers
+# ---------------------------------------------------------------------------
+
+
+def pooled_sigma(cohort: Cohort, radius: FloatArray) -> FloatArray:
+    """Pooled OLS residual sigma for (..., segments, scans) radii at the cohort's days."""
+    mask = cohort.mask
+    n = mask.sum(axis=1)
+    tc = np.where(mask, _centred_days(cohort), 0.0)
+    y = np.where(mask, radius, 0.0)
+    y_mean = y.sum(axis=-1, keepdims=True) / n[:, None]
+    slope = (tc * (y - y_mean)).sum(axis=-1) / (tc**2).sum(axis=1)
+    residual = np.where(mask, y - y_mean - slope[..., None] * tc, 0.0)
+    return np.sqrt((residual**2).sum(axis=(-2, -1)) / (n - 2).sum())
+
+
+def _consecutive_changes(radius: FloatArray) -> tuple[FloatArray, FloatArray, NDArray[np.bool_]]:
+    change = np.diff(radius, axis=-1)
+    first, second = change[..., :-1], change[..., 1:]
+    valid = ~(np.isnan(first) | np.isnan(second))
+    lead = radius.shape[:-2]
+    return (
+        np.where(valid, first, 0.0).reshape(*lead, -1),
+        np.where(valid, second, 0.0).reshape(*lead, -1),
+        valid.reshape(*lead, -1),
+    )
+
+
+def persistence(radius: FloatArray) -> FloatArray:
+    """Pearson correlation of consecutive radius changes, pooled over segments."""
+    first, second, valid = _consecutive_changes(radius)
+    count = valid.sum(axis=-1)
+    df = np.where(valid, first - (first.sum(axis=-1) / count)[..., None], 0.0)
+    ds = np.where(valid, second - (second.sum(axis=-1) / count)[..., None], 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (df * ds).sum(axis=-1) / np.sqrt((df**2).sum(axis=-1) * (ds**2).sum(axis=-1))
+
+
+def sign_concordance(radius: FloatArray) -> FloatArray:
+    """Mean of sign(Δr_k)·sign(Δr_k+1) over consecutive interval pairs."""
+    first, second, valid = _consecutive_changes(radius)
+    agreement = np.where(valid, np.sign(first) * np.sign(second), 0.0)
+    return agreement.sum(axis=-1) / valid.sum(axis=-1)
+
+
+@dataclass(frozen=True, slots=True)
+class Draws:
+    """Common random numbers so rival simulations vary smoothly in their parameters."""
+
+    normal: FloatArray
+    contamination: FloatArray
+    switch: FloatArray
+
+    @classmethod
+    def sample(cls, cohort: Cohort, draws: int, rng: np.random.Generator) -> Draws:
+        shape = (draws, *cohort.days.shape)
+        return cls(
+            rng.standard_normal(shape),
+            rng.uniform(size=shape),
+            rng.uniform(size=shape[:2]),
+        )
+
+
+def _finish(cohort: Cohort, sample: FloatArray) -> FloatArray:
+    return np.where(cohort.mask, np.clip(sample, 0.0, None), np.nan)
+
+
+def simulate_outliers(
+    cohort: Cohort, fit: LinearFit, draws: Draws, *, rate: float, noise: float, scale: float = 4.0
+) -> FloatArray:
+    """Steady growth with contaminated noise: a share ``rate`` of scans err ``scale``x more."""
+    tc = _centred_days(cohort)
+    mean = fit.intercept[:, None] + fit.slope[:, None] * tc
+    factor = np.where(draws.contamination < rate, scale, 1.0)
+    return _finish(cohort, mean[None] + noise * factor * draws.normal)
+
+
+def simulate_regime_change(
+    cohort: Cohort, fit: LinearFit, draws: Draws, *, amplitude: float, noise: float
+) -> FloatArray:
+    """Flat until a uniform switch time, then linear to the H0 net change plus ``amplitude``."""
+    tc = _centred_days(cohort)
+    first = np.nanmin(tc, axis=1)
+    last = np.nanmax(tc, axis=1)
+    start = fit.intercept + fit.slope * first
+    net = fit.slope * (last - first)
+    total = net + np.where(net >= 0, 1.0, -1.0) * amplitude
+    switch = first[None, :] + draws.switch * (last - first)[None, :]
+    elapsed = np.clip(tc[None] - switch[..., None], 0.0, None)
+    remaining = np.maximum(last[None, :] - switch, 1e-9)
+    mean = start[None, :, None] + (total[None, :] / remaining)[..., None] * elapsed
+    return _finish(cohort, mean + noise * draws.normal)
+
+
+@dataclass(frozen=True, slots=True)
+class Calibration:
+    parameter: float
+    noise: float
+    bunching: float
+    reproduces: bool
+
+    def as_dict(self) -> dict[str, float | bool]:
+        return {
+            "parameter": self.parameter,
+            "noise_mm": self.noise,
+            "mean_bunching": self.bunching,
+            "reproduces_observed_bunching": self.reproduces,
+        }
+
+
+def calibrate(
+    cohort: Cohort,
+    simulate: Callable[[float, float], FloatArray],
+    grid: Sequence[float],
+    *,
+    target_bunching: float,
+    target_sigma: float,
+    tolerance: float = 0.005,
+) -> Calibration:
+    """Pick the grid value whose noise-matched simulations best reproduce the bunching.
+
+    For each grid value the noise level is bisected so the mean refitted
+    pooled sigma equals ``target_sigma``; the grid value with mean bunching
+    closest to ``target_bunching`` is returned.
+    """
+    best: Calibration | None = None
+    for parameter in grid:
+        low, high = 1e-6, 2.0 * target_sigma
+        for _ in range(30):
+            mid = 0.5 * (low + high)
+            if pooled_sigma(cohort, simulate(parameter, mid)).mean() < target_sigma:
+                low = mid
+            else:
+                high = mid
+        noise = 0.5 * (low + high)
+        mean_bunching = float(bunching(simulate(parameter, noise)).mean())
+        if best is None or abs(mean_bunching - target_bunching) < abs(
+            best.bunching - target_bunching
+        ):
+            best = Calibration(float(parameter), noise, mean_bunching, False)
+    assert best is not None
+    reproduces = abs(best.bunching - target_bunching) <= tolerance
+    return Calibration(best.parameter, best.noise, best.bunching, reproduces)
+
+
+def separation_auc(higher: FloatArray, lower: FloatArray) -> float:
+    """Probability a draw from ``higher`` exceeds one from ``lower`` (ties count half)."""
+    ranks = rankdata(np.concatenate([higher, lower]))
+    u = ranks[: higher.size].sum() - higher.size * (higher.size + 1) / 2.0
+    return float(u / (higher.size * lower.size))
+
+
+def central_interval(sample: FloatArray, level: float = 0.95) -> tuple[float, float]:
+    tail = (1.0 - level) / 2.0
+    low, high = np.quantile(sample, [tail, 1.0 - tail])
+    return float(low), float(high)
+
+
+def persistence_verdict(
+    observed: float,
+    regime: FloatArray,
+    outliers: FloatArray,
+    *,
+    min_auc: float = 0.80,
+) -> dict[str, object]:
+    """Pre-registered decision for the persistence test."""
+    auc = separation_auc(regime, outliers)
+    regime_low, regime_high = central_interval(regime)
+    outlier_low, outlier_high = central_interval(outliers)
+    regime_ok = regime_low <= observed <= regime_high
+    outlier_ok = outlier_low <= observed <= outlier_high
+    if auc < min_auc:
+        verdict = "inconclusive: rivals not separable"
+    elif regime_ok and not outlier_ok:
+        verdict = "switching favored"
+    elif outlier_ok and not regime_ok:
+        verdict = "outliers favored"
+    elif regime_ok and outlier_ok:
+        verdict = "undetermined: both rivals compatible"
+    else:
+        verdict = "neither rival explains the data"
+    return {
+        "auc_regime_above_outliers": auc,
+        "regime_interval": [regime_low, regime_high],
+        "outlier_interval": [outlier_low, outlier_high],
+        "regime_compatible": regime_ok,
+        "outliers_compatible": outlier_ok,
+        "verdict": verdict,
+    }

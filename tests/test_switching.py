@@ -3,12 +3,21 @@ import pytest
 
 from gbm_pinn.switching import (
     Cohort,
+    Draws,
     bunching,
     bunching_test,
+    calibrate,
     fit_linear,
     largest_change_is_growth,
+    persistence,
+    persistence_verdict,
+    pooled_sigma,
     radius_mm,
     rejection_rate,
+    separation_auc,
+    sign_concordance,
+    simulate_outliers,
+    simulate_regime_change,
     simulate_switching,
     split_segments,
 )
@@ -86,3 +95,63 @@ def test_type_one_rate_is_controlled():
         base.with_radius(radius), alternative="steady", cohorts=60, draws=300, rng=rng
     )
     assert rate <= 0.15
+
+
+def test_persistence_and_sign_concordance_on_known_patterns():
+    trend = np.array([[0.0, 1.0, 3.0, 6.0], [0.0, 2.0, 2.5, 2.7]])
+    zigzag = np.array([[0.0, 2.0, 0.0, 2.0], [0.0, -1.0, 0.0, -1.0]])
+    assert persistence(trend) > 0
+    assert persistence(zigzag) == pytest.approx(-1.0)
+    assert sign_concordance(trend) == pytest.approx(1.0)
+    assert sign_concordance(zigzag) == pytest.approx(-1.0)
+
+
+def test_pooled_sigma_matches_fit_linear():
+    rng = np.random.default_rng(4)
+    base = _synthetic_cohort(rng)
+    radius = 10.0 + 0.01 * base.days + rng.standard_normal(base.days.shape)
+    cohort = base.with_radius(radius)
+    assert pooled_sigma(cohort, cohort.radius) == pytest.approx(fit_linear(cohort).sigma)
+
+
+def test_rivals_predict_opposite_persistence():
+    rng = np.random.default_rng(5)
+    base = _synthetic_cohort(rng, segments=80)
+    fit = fit_linear(base.with_radius(10.0 + 0.01 * base.days))
+    draws = Draws.sample(base, 200, rng)
+    steady = simulate_outliers(base, fit, draws, rate=0.0, noise=1.0)
+    outliers = simulate_outliers(base, fit, draws, rate=0.2, noise=1.0)
+    regime = simulate_regime_change(base, fit, draws, amplitude=6.0, noise=1.0)
+    assert persistence(outliers).mean() < persistence(steady).mean()
+    assert persistence(regime).mean() > persistence(steady).mean()
+
+
+def test_calibration_hits_noise_and_bunching_targets():
+    rng = np.random.default_rng(6)
+    base = _synthetic_cohort(rng, segments=80)
+    fit = fit_linear(base.with_radius(10.0 + 0.01 * base.days))
+    draws = Draws.sample(base, 150, rng)
+    truth = simulate_regime_change(base, fit, draws, amplitude=4.0, noise=1.0)
+    target_bunching = float(bunching(truth).mean())
+    target_sigma = float(pooled_sigma(base, truth).mean())
+    result = calibrate(
+        base,
+        lambda a, s: simulate_regime_change(base, fit, draws, amplitude=a, noise=s),
+        np.linspace(0.0, 8.0, 17),
+        target_bunching=target_bunching,
+        target_sigma=target_sigma,
+    )
+    assert result.reproduces
+    assert result.parameter == pytest.approx(4.0, abs=1.0)
+    assert result.noise == pytest.approx(1.0, rel=0.2)
+
+
+def test_separation_auc_and_verdict():
+    high = np.linspace(1.0, 2.0, 50)
+    low = np.linspace(-2.0, -1.0, 50)
+    assert separation_auc(high, low) == pytest.approx(1.0)
+    assert separation_auc(high, high) == pytest.approx(0.5)
+    assert persistence_verdict(1.5, high, low)["verdict"] == "switching favored"
+    assert persistence_verdict(-1.5, high, low)["verdict"] == "outliers favored"
+    assert persistence_verdict(0.0, high, low)["verdict"] == "neither rival explains the data"
+    assert persistence_verdict(1.5, high, high)["verdict"].startswith("inconclusive")
