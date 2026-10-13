@@ -32,12 +32,15 @@ def main() -> None:
     args.output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         json.dumps(
-            {key: index[key] for key in (
-                "patient_count",
-                "locally_complete_patient_count",
-                "transition_count",
-                "missing_patient_ids",
-            )},
+            {
+                key: index[key]
+                for key in (
+                    "patient_count",
+                    "locally_complete_patient_count",
+                    "transition_count",
+                    "missing_patient_ids",
+                )
+            },
             indent=2,
             sort_keys=True,
         )

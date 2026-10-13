@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import time as time_module
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,6 @@ from gbm_pinn.clinical_3d_experiment import (
     _sample_volume_interior,
 )
 from gbm_pinn.clinical_experiment import (
-    _load_observation_brain_mask,
     _masked_dice,
     _masked_volume_error,
     _synchronize_device,
@@ -88,7 +86,8 @@ class PINNCohortConfig:
 def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
     """Train one PINN per patient on all scans, forecast each transition."""
     transitions = load_transition_manifest(
-        config.transition_index_path, required_role=config.role,
+        config.transition_index_path,
+        required_role=config.role,
     )
     manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
     treatment_lookup = _build_treatment_lookup(manifest)
@@ -107,9 +106,7 @@ def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
     total_transitions = len(transitions)
 
     for patient_id, patient_transitions in patients.items():
-        all_completed = all(
-            t["transition_id"] in completed_ids for t in patient_transitions
-        )
+        all_completed = all(t["transition_id"] in completed_ids for t in patient_transitions)
         if all_completed:
             for t in patient_transitions:
                 transition_index += 1
@@ -155,7 +152,9 @@ def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
             transition_index += 1
             records.append(record)
             _save_transition_result(
-                config.output_root, record["transition_id"], record,
+                config.output_root,
+                record["transition_id"],
+                record,
             )
             if record.get("status") == "success":
                 print(
@@ -168,15 +167,15 @@ def run_pinn_cohort(config: PINNCohortConfig) -> dict[str, Any]:
                 )
             else:
                 print(
-                    f"[{transition_index}/{total_transitions}] "
-                    f"{record['transition_id']}: FAILED",
+                    f"[{transition_index}/{total_transitions}] {record['transition_id']}: FAILED",
                     flush=True,
                 )
 
     summary = summarize_cohort(records)
     summary_path = config.output_root / "cohort_summary.json"
     summary_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return summary
 
@@ -241,7 +240,8 @@ def _run_patient(
             shape = lab.shape
         labels_by_day[day] = lab
         densities_by_day[day] = segmentation_to_density(
-            lab, infiltrative_density=config.infiltrative_density,
+            lab,
+            infiltrative_density=config.infiltrative_density,
         )
 
     assert affine is not None and shape is not None
@@ -250,7 +250,8 @@ def _run_patient(
 
     first_labels = labels_by_day[first_day]
     brain_mask = _build_brain_mask_fallback(
-        first_labels, densities_by_day[first_day],
+        first_labels,
+        densities_by_day[first_day],
     )
     for day_labels in labels_by_day.values():
         brain_mask = brain_mask | _build_brain_mask_fallback(
@@ -285,19 +286,29 @@ def _run_patient(
         rng,
     )
     collocation = _sample_volume_interior(
-        active_mask, spacing, total_span, config.collocation_points, rng,
+        active_mask,
+        spacing,
+        total_span,
+        config.collocation_points,
+        rng,
     )
     boundary, normals = _sample_volume_boundary(
-        active_mask, spacing, total_span, config.boundary_points, rng,
+        active_mask,
+        spacing,
+        total_span,
+        config.boundary_points,
+        rng,
     )
 
     lower = torch.zeros(4)
-    upper = torch.tensor([
-        (shape[0] - 1) * spacing[0],
-        (shape[1] - 1) * spacing[1],
-        (shape[2] - 1) * spacing[2],
-        total_span,
-    ])
+    upper = torch.tensor(
+        [
+            (shape[0] - 1) * spacing[0],
+            (shape[1] - 1) * spacing[1],
+            (shape[2] - 1) * spacing[2],
+            total_span,
+        ]
+    )
 
     pinn_config = PINNConfig(
         hidden_width=config.hidden_width,
@@ -308,18 +319,21 @@ def _run_patient(
         initial_proliferation_rate=config.initial_proliferation_rate,
     )
 
-    first_source_day = float(transitions[0]["source_day"])
-    last_target_day = max(float(t["target_day"]) for t in transitions)
     treatment_windows: tuple[TreatmentWindow, ...] = ()
     if config.enable_treatment and patient_id in treatment_lookup:
         treatment_windows = extract_treatment_windows(
-            treatment_lookup[patient_id], first_day, last_day,
+            treatment_lookup[patient_id],
+            first_day,
+            last_day,
         )
 
     model: TumorPINN
     if treatment_windows:
         model = TreatmentAwareTumorPINN(
-            lower, upper, treatment_windows, pinn_config,
+            lower,
+            upper,
+            treatment_windows,
+            pinn_config,
             treatment_response_bounds=config.treatment_response_bounds,
             initial_treatment_response=config.initial_treatment_response,
         )
@@ -392,11 +406,13 @@ def _run_patient(
             cavity_mask=cavity_mask_t,
         )
 
-        def treatment_fn(time: float) -> float:
-            abs_time = time + (source_day - first_day)
-            exposure = sum(
-                _window_exposure(w, abs_time) for w in treatment_windows
-            )
+        def treatment_fn(
+            time: float,
+            *,
+            transition_source_day: float = source_day,
+        ) -> float:
+            abs_time = time + (transition_source_day - first_day)
+            exposure = sum(_window_exposure(w, abs_time) for w in treatment_windows)
             return estimated_kappa * exposure
 
         fv_start = time_module.perf_counter()
@@ -418,43 +434,54 @@ def _run_patient(
             blended = True
 
         forecast_dice = _masked_dice(
-            prediction, target_density, brain_mask, config.threshold,
+            prediction,
+            target_density,
+            brain_mask,
+            config.threshold,
         )
         persistence_dice = _masked_dice(
-            source_density, target_density, brain_mask, config.threshold,
+            source_density,
+            target_density,
+            brain_mask,
+            config.threshold,
         )
         volume_error = _masked_volume_error(
-            prediction, target_density, brain_mask, config.threshold,
+            prediction,
+            target_density,
+            brain_mask,
+            config.threshold,
         )
         difference = prediction[brain_mask] - target_density[brain_mask]
 
-        results.append({
-            "transition_id": tid,
-            "patient_id": patient_id,
-            "status": "success",
-            "volume_shape": list(shape),
-            "voxel_spacing_mm": list(spacing),
-            "horizon_days": horizon_days,
-            "n_patient_scans": len(all_scans),
-            "has_treatment_windows": bool(treatment_windows),
-            "training_seconds": training_seconds,
-            "fv_simulation_seconds": fv_seconds,
-            "estimated_diffusivity_mm2_per_day": estimated_d,
-            "estimated_proliferation_per_day": estimated_rho,
-            "estimated_treatment_response_per_day": (
-                None if response is None else estimated_kappa
-            ),
-            "forecast_dice": forecast_dice,
-            "persistence_dice": persistence_dice,
-            "dice_skill_over_persistence": forecast_dice - persistence_dice,
-            "beats_persistence": forecast_dice > persistence_dice,
-            "forecast_volume_relative_error": volume_error,
-            "volume_ratio_before_blend": volume_ratio,
-            "blended_with_persistence": blended,
-            "forecast_rmse": float(np.sqrt(np.mean(difference ** 2))),
-            "initial_total_loss": training.total_loss[0],
-            "final_total_loss": training.total_loss[-1],
-        })
+        results.append(
+            {
+                "transition_id": tid,
+                "patient_id": patient_id,
+                "status": "success",
+                "volume_shape": list(shape),
+                "voxel_spacing_mm": list(spacing),
+                "horizon_days": horizon_days,
+                "n_patient_scans": len(all_scans),
+                "has_treatment_windows": bool(treatment_windows),
+                "training_seconds": training_seconds,
+                "fv_simulation_seconds": fv_seconds,
+                "estimated_diffusivity_mm2_per_day": estimated_d,
+                "estimated_proliferation_per_day": estimated_rho,
+                "estimated_treatment_response_per_day": (
+                    None if response is None else estimated_kappa
+                ),
+                "forecast_dice": forecast_dice,
+                "persistence_dice": persistence_dice,
+                "dice_skill_over_persistence": forecast_dice - persistence_dice,
+                "beats_persistence": forecast_dice > persistence_dice,
+                "forecast_volume_relative_error": volume_error,
+                "volume_ratio_before_blend": volume_ratio,
+                "blended_with_persistence": blended,
+                "forecast_rmse": float(np.sqrt(np.mean(difference**2))),
+                "initial_total_loss": training.total_loss[0],
+                "final_total_loss": training.total_loss[-1],
+            }
+        )
 
     return results
 
@@ -502,10 +529,12 @@ def _window_exposure(window: TreatmentWindow, time: float) -> float:
 
 
 def _build_brain_mask_fallback(
-    labels: NDArray[np.integer], density: FloatArray,
+    labels: NDArray[np.integer],
+    density: FloatArray,
 ) -> BoolArray:
     """Fallback brain mask from segmentation labels when MRI is unavailable."""
     from scipy import ndimage
+
     tumor_or_cavity = labels > 0
     dilated = ndimage.binary_dilation(tumor_or_cavity, iterations=10)
     return dilated | (density > 0)
@@ -540,7 +569,8 @@ def _load_completed_ids(output_root: Path) -> set[str]:
 
 
 def _load_transition_result(
-    output_root: Path, transition_id: str,
+    output_root: Path,
+    transition_id: str,
 ) -> dict[str, Any] | None:
     """Load a single per-transition result file if it exists."""
     path = output_root / f"{transition_id}.json"
@@ -553,7 +583,9 @@ def _load_transition_result(
 
 
 def _save_transition_result(
-    output_root: Path, transition_id: str, record: dict[str, Any],
+    output_root: Path,
+    transition_id: str,
+    record: dict[str, Any],
 ) -> None:
     """Write one per-transition result to disk."""
     path = output_root / f"{transition_id}.json"

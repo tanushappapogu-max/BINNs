@@ -44,9 +44,7 @@ def main() -> None:
         seed=args.seed,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = {
         "eligible_patients": len(patients),
         "transitions": sum(patient.transition_count for patient in patients),

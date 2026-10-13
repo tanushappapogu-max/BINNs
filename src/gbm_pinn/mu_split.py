@@ -77,9 +77,7 @@ def eligible_mu_patients(rows: Iterable[Mapping[str, Any]]) -> tuple[MuPatient, 
             for key, value in row.items()
             if "MRI (Timepoint_" in str(key) and _finite(value)
         )
-        if len(scan_days) < 2 or any(
-            later <= earlier for earlier, later in pairwise(scan_days)
-        ):
+        if len(scan_days) < 2 or any(later <= earlier for earlier, later in pairwise(scan_days)):
             continue
         patients.append(
             MuPatient(
@@ -280,9 +278,7 @@ def extract_mu_treatment_events(
     brachy_name = _clean_text(row.get("Brachy therapy"))
     if _truthy_treatment(brachy_name):
         day = _number(
-            row.get(
-                "Number of Days from Diagnosis to the day of Insertion of Brachytherapy "
-            )
+            row.get("Number of Days from Diagnosis to the day of Insertion of Brachytherapy ")
         )
         events.append(
             MuTreatmentEvent(

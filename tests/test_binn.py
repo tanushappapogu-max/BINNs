@@ -35,7 +35,10 @@ def _true_R(u):
 def _make_dataset(noise=0.02, seed=0):
     rng = np.random.default_rng(seed)
     snaps, times, x = simulate_reaction_diffusion(
-        _true_D, _true_R, length=LENGTH, duration=DURATION,
+        _true_D,
+        _true_R,
+        length=LENGTH,
+        duration=DURATION,
     )
     xx, tt = np.meshgrid(x, times)
     coords = np.stack([xx.ravel(), tt.ravel()], axis=1)
@@ -62,17 +65,20 @@ def test_diffusivity_is_nonnegative():
 
 
 def test_reference_solver_grows_then_saturates():
-    snaps, times, x = simulate_reaction_diffusion(_true_D, _true_R)
+    snaps, _, _ = simulate_reaction_diffusion(_true_D, _true_R)
     mass = snaps.sum(axis=1)
-    assert mass[-1] > mass[0]                       # net growth
-    assert np.all(np.isfinite(snaps))               # stable
-    assert snaps.max() <= 1.5 + 1e-6                # bounded
+    assert mass[-1] > mass[0]  # net growth
+    assert np.all(np.isfinite(snaps))  # stable
+    assert snaps.max() <= 1.5 + 1e-6  # bounded
 
 
 def test_binn_recovers_solution_and_growth():
     coords, clean, noisy = _make_dataset(noise=0.02)
     model = fit_binn(
-        coords, noisy, x_scale=LENGTH, t_scale=DURATION,
+        coords,
+        noisy,
+        x_scale=LENGTH,
+        t_scale=DURATION,
         config=BINNConfig(iterations=2500, device="cpu", seed=0),
     )
     r2 = solution_r2(model, coords, clean)

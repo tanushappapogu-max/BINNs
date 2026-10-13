@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
 import torch
 
 from gbm_pinn.unet_forecaster import (
@@ -35,8 +33,13 @@ def test_pure_diffusion_conserves_mass():
     sim = ReactionDiffusionSimulator(n_steps=10, dt=0.1)
     u = torch.zeros(1, 1, 20, 20, 20)
     u[:, :, 9:11, 9:11, 9:11] = 0.5
-    out = sim(u, torch.tensor([0.05]), torch.tensor([0.0]), torch.tensor([0.0]),
-              d_field=torch.ones_like(u))
+    out = sim(
+        u,
+        torch.tensor([0.05]),
+        torch.tensor([0.0]),
+        torch.tensor([0.0]),
+        d_field=torch.ones_like(u),
+    )
     assert abs(float(out.sum()) - float(u.sum())) < 1e-3
 
 
@@ -96,7 +99,7 @@ def test_parameter_net_starts_at_persistence():
         D, rho, kappa = net(source, treatment, horizon)
         sim = ReactionDiffusionSimulator(n_steps=30, dt=0.2)
         out = sim(source, D, rho, kappa)
-        dice = float(2 * (out * source).sum() / ((out ** 2).sum() + (source ** 2).sum()))
+        dice = float(2 * (out * source).sum() / ((out**2).sum() + (source**2).sum()))
     assert dice > 0.95
 
 
@@ -143,8 +146,15 @@ def test_spatial_field_starts_uniform_and_flows_gradients():
     u = _blob((2, 1, 24, 24, 16))
     tgt = torch.zeros(2, 1, 24, 24, 16)
     tgt[:, :, 8:12, 4:10, 6:10] = 1.0
-    out = sim(u, torch.tensor([0.5, 0.5]), torch.tensor([0.3, 0.3]),
-              torch.tensor([0.0, 0.0]), None, None, net(x))
+    out = sim(
+        u,
+        torch.tensor([0.5, 0.5]),
+        torch.tensor([0.3, 0.3]),
+        torch.tensor([0.0, 0.0]),
+        None,
+        None,
+        net(x),
+    )
     soft_dice_loss(out, tgt).backward()
     grad = sum(p.grad.abs().sum().item() for p in net.parameters() if p.grad is not None)
     assert grad > 1e-6
@@ -159,14 +169,34 @@ def test_soft_dice_loss_ignores_zero_background():
 
 def test_summarize_reports_gap_correlation():
     records = [
-        {"patient_id": "P1", "dice_skill": 0.02, "horizon_days": 30.0,
-         "true_volume_change_ml": 5.0, "predicted_volume_change_ml": 1.0},
-        {"patient_id": "P1", "dice_skill": 0.01, "horizon_days": 400.0,
-         "true_volume_change_ml": 2.0, "predicted_volume_change_ml": -1.0},
-        {"patient_id": "P2", "dice_skill": -0.01, "horizon_days": 100.0,
-         "true_volume_change_ml": 8.0, "predicted_volume_change_ml": 3.0},
-        {"patient_id": "P3", "dice_skill": 0.03, "horizon_days": 60.0,
-         "true_volume_change_ml": 4.0, "predicted_volume_change_ml": 2.0},
+        {
+            "patient_id": "P1",
+            "dice_skill": 0.02,
+            "horizon_days": 30.0,
+            "true_volume_change_ml": 5.0,
+            "predicted_volume_change_ml": 1.0,
+        },
+        {
+            "patient_id": "P1",
+            "dice_skill": 0.01,
+            "horizon_days": 400.0,
+            "true_volume_change_ml": 2.0,
+            "predicted_volume_change_ml": -1.0,
+        },
+        {
+            "patient_id": "P2",
+            "dice_skill": -0.01,
+            "horizon_days": 100.0,
+            "true_volume_change_ml": 8.0,
+            "predicted_volume_change_ml": 3.0,
+        },
+        {
+            "patient_id": "P3",
+            "dice_skill": 0.03,
+            "horizon_days": 60.0,
+            "true_volume_change_ml": 4.0,
+            "predicted_volume_change_ml": 2.0,
+        },
     ]
     summary = summarize_records(records)
     assert "pred_change_vs_gap_correlation" in summary

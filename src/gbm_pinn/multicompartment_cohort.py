@@ -21,15 +21,11 @@ from gbm_pinn.multicompartment_pinn import (
 from gbm_pinn.pinn import PINNConfig
 from gbm_pinn.treatment import TreatmentWindow
 
-SYSTEMIC_CELL_KILL_MODALITIES = frozenset(
-    {"temozolomide_initial", "temozolomide_additional"}
-)
+SYSTEMIC_CELL_KILL_MODALITIES = frozenset({"temozolomide_initial", "temozolomide_additional"})
 ANTIANGIOGENIC_MODALITIES = frozenset({"avastin", "bevacizumab"})
 DEFERRED_EVENT_MODALITIES = frozenset({"radiation", "optune_ttf"})
 KNOWN_TREATMENT_MODALITIES = (
-    SYSTEMIC_CELL_KILL_MODALITIES
-    | ANTIANGIOGENIC_MODALITIES
-    | DEFERRED_EVENT_MODALITIES
+    SYSTEMIC_CELL_KILL_MODALITIES | ANTIANGIOGENIC_MODALITIES | DEFERRED_EVENT_MODALITIES
 )
 COHORT_ROLES = frozenset({"training", "model_selection", "final_test"})
 
@@ -71,9 +67,7 @@ def load_multicompartment_manifest(path: Path) -> dict[str, Any]:
                 modality = window.get("modality")
                 if modality not in KNOWN_TREATMENT_MODALITIES:
                     raise ValueError(f"{patient_id} has unknown treatment modality: {modality}")
-                if key == "edema_treatment_windows" and modality not in (
-                    ANTIANGIOGENIC_MODALITIES
-                ):
+                if key == "edema_treatment_windows" and modality not in (ANTIANGIOGENIC_MODALITIES):
                     raise ValueError(
                         f"{patient_id} has non-antiangiogenic treatment in edema windows"
                     )
@@ -83,9 +77,7 @@ def load_multicompartment_manifest(path: Path) -> dict[str, Any]:
 def summarize_training(records: list[dict[str, Any]]) -> dict[str, Any]:
     successful = [record for record in records if record.get("status") == "success"]
     evaluable = [
-        record
-        for record in successful
-        if record["whole_abnormality_metrics"].get("evaluable")
+        record for record in successful if record["whole_abnormality_metrics"].get("evaluable")
     ]
     skills = [
         float(record["whole_abnormality_metrics"]["dice_skill_over_persistence"])
@@ -93,8 +85,7 @@ def summarize_training(records: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     dice = [float(record["whole_abnormality_metrics"]["forecast_dice"]) for record in evaluable]
     volume_errors = [
-        float(record["whole_abnormality_metrics"]["volume_relative_error"])
-        for record in evaluable
+        float(record["whole_abnormality_metrics"]["volume_relative_error"]) for record in evaluable
     ]
     scenario_agreements = [
         float(record["scenario_disagreement"]["scenario_agreement_dice"])
@@ -239,9 +230,7 @@ def _clinical_config(
             detection_limits=tuple(float(v) for v in protocol["detection_limits"]),
             normalize_loss_terms=True,
             field_warmup_epochs=int(protocol.get("field_warmup_epochs", 0)),
-            parameter_calibration_epochs=int(
-                protocol.get("parameter_calibration_epochs", 0)
-            ),
+            parameter_calibration_epochs=int(protocol.get("parameter_calibration_epochs", 0)),
         ),
         checkpoint_path=output / "checkpoint.pt",
         artifact_path=output / "forecast.npz",
@@ -261,9 +250,7 @@ def _windows_for_modalities(
     values: list[dict[str, Any]],
     allowed_modalities: frozenset[str],
 ) -> tuple[TreatmentWindow, ...]:
-    return tuple(
-        _window(value) for value in values if value.get("modality") in allowed_modalities
-    )
+    return tuple(_window(value) for value in values if value.get("modality") in allowed_modalities)
 
 
 def _write_summary(

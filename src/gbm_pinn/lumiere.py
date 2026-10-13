@@ -67,8 +67,10 @@ def remap_lumiere_segmentation(labels: NDArray[np.integer]) -> NDArray[np.int16]
     3 enhancing, and 4 cavity. LUMIERE does not provide a cavity label.
     """
     labels = np.asarray(labels)
-    if labels.ndim != 3 or np.any(~np.isfinite(labels)) or not np.allclose(
-        labels, np.rint(labels), atol=1e-6
+    if (
+        labels.ndim != 3
+        or np.any(~np.isfinite(labels))
+        or not np.allclose(labels, np.rint(labels), atol=1e-6)
     ):
         raise ValueError("LUMIERE segmentation must be a finite integer 3D volume")
     integer = np.rint(labels).astype(np.int16)
@@ -91,12 +93,8 @@ def validate_prepared_lumiere(
     for patient_id, sessions in selected.items():
         for session in sessions:
             directory = prepared_root / patient_id / f"week-{session.week:03d}"
-            segmentation = directory / (
-                f"{patient_id}_week-{session.week:03d}_tumorMask.nii.gz"
-            )
-            brain_mask = directory / (
-                f"{patient_id}_week-{session.week:03d}_brain_mask.nii.gz"
-            )
+            segmentation = directory / (f"{patient_id}_week-{session.week:03d}_tumorMask.nii.gz")
+            brain_mask = directory / (f"{patient_id}_week-{session.week:03d}_brain_mask.nii.gz")
             if not segmentation.is_file() or not brain_mask.is_file():
                 missing.append(f"{patient_id}/week-{session.week:03d}")
     if missing:

@@ -10,10 +10,7 @@ from gbm_pinn.lumiere import (
 
 
 def _members(patient: str, week: int) -> tuple[str, str]:
-    prefix = (
-        f"Imaging/{patient}/week-{week:03d}/"
-        "DeepBraTumIA-segmentation/atlas/"
-    )
+    prefix = f"Imaging/{patient}/week-{week:03d}/DeepBraTumIA-segmentation/atlas/"
     return (
         f"{prefix}segmentation/seg_mask.nii.gz",
         f"{prefix}skull_strip/brain_mask.nii.gz",
@@ -50,9 +47,7 @@ def test_lumiere_manifest_uses_week_based_days(tmp_path) -> None:
 
     assert manifest["patients"][0]["scan_days"] == [0.0, 14.0, 105.0, 126.0]
     assert manifest["license"] == "CC0"
-    assert manifest["dataset_contract"]["unavailable_labels"] == [
-        "resection_cavity"
-    ]
+    assert manifest["dataset_contract"]["unavailable_labels"] == ["resection_cavity"]
 
 
 def test_preparation_validation_rejects_incomplete_sessions(tmp_path) -> None:

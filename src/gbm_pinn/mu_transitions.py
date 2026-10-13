@@ -75,9 +75,7 @@ def build_mu_transition_index(
                 source_day=scans.days[source_index],
                 target_day=scans.days[target_index],
             )
-            source_morphology = source_morphology_features(
-                scans.labels[source_index], scans.affine
-            )
+            source_morphology = source_morphology_features(scans.labels[source_index], scans.affine)
             history_available = source_index > 0
             previous_index = source_index - 1 if history_available else source_index
             transitions.append(
@@ -153,9 +151,7 @@ def source_morphology_features(
     if affine.shape != (4, 4) or not np.all(np.isfinite(affine)):
         raise ValueError("source affine must be a finite 4x4 matrix")
     rounded = np.rint(labels)
-    if not np.array_equal(labels, rounded) or not set(np.unique(rounded)).issubset(
-        {0, 1, 2, 3, 4}
-    ):
+    if not np.array_equal(labels, rounded) or not set(np.unique(rounded)).issubset({0, 1, 2, 3, 4}):
         raise ValueError("source labels must use the MU label convention 0 through 4")
     voxel_volume_ml = abs(float(np.linalg.det(affine[:3, :3]))) / 1_000.0
     counts = {

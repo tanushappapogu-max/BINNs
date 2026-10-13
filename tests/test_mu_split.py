@@ -36,10 +36,7 @@ def test_eligibility_requires_gbm_and_two_increasing_dated_scans() -> None:
 
 
 def test_split_is_patient_level_reproducible_and_preserves_assignments() -> None:
-    patients = tuple(
-        MuPatient(f"P{index:03d}", (0.0, 20.0), "GBM", "4")
-        for index in range(20)
-    )
+    patients = tuple(MuPatient(f"P{index:03d}", (0.0, 20.0), "GBM", "4") for index in range(20))
 
     first = assign_mu_roles(patients, preserved_roles={"P000": "final_test"}, seed=7)
     second = assign_mu_roles(patients, preserved_roles={"P000": "final_test"}, seed=7)

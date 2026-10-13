@@ -76,9 +76,7 @@ def test_scenario_disagreement_does_not_require_future_target() -> None:
     mechanistic = np.array([[1.0, 1.0], [0.0, 0.0]])
     persistence = np.array([[1.0, 0.0], [0.0, 0.0]])
 
-    result = _scenario_disagreement(
-        mechanistic, persistence, np.ones_like(mechanistic, bool), 0.5
-    )
+    result = _scenario_disagreement(mechanistic, persistence, np.ones_like(mechanistic, bool), 0.5)
 
     assert result["scenario_agreement_dice"] == pytest.approx(2 / 3)
     assert result["disagreement_voxels"] == 1

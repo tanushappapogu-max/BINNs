@@ -471,7 +471,9 @@ def fit_pinn(
             + config.interface_weight * interface_loss
         )
         if config.proliferation_regularization > 0:
-            total_loss = total_loss + config.proliferation_regularization * model.proliferation_rate ** 2
+            total_loss = (
+                total_loss + config.proliferation_regularization * model.proliferation_rate**2
+            )
         return total_loss, data_loss, physics_loss, boundary_loss, interface_loss
 
     def record_losses(

@@ -61,9 +61,7 @@ class MultiCompartmentClinicalConfig:
     treatment_windows: tuple[TreatmentWindow, ...] = ()
     edema_treatment_windows: tuple[TreatmentWindow, ...] = ()
     pinn: MultiCompartmentPINNConfig = field(default_factory=MultiCompartmentPINNConfig)
-    training: MultiCompartmentTrainingConfig = field(
-        default_factory=MultiCompartmentTrainingConfig
-    )
+    training: MultiCompartmentTrainingConfig = field(default_factory=MultiCompartmentTrainingConfig)
     checkpoint_path: Path | None = None
     resume_from_checkpoint: bool = False
     artifact_path: Path | None = None
@@ -185,8 +183,7 @@ def run_multicompartment_clinical(
         edema_treatment_windows=shifted_edema_windows,
     ).to(device)
     data_coordinates, targets, collocation, boundary, normals = (
-        value.to(device)
-        for value in (data_coordinates, targets, collocation, boundary, normals)
+        value.to(device) for value in (data_coordinates, targets, collocation, boundary, normals)
     )
     _synchronize_device(device)
     start = time_module.perf_counter()
@@ -222,13 +219,9 @@ def run_multicompartment_clinical(
             edema_clearance_rate=float(parameters["edema_clearance_per_day"]),
             necrosis_clearance_rate=float(parameters["necrosis_clearance_per_day"]),
             edema_half_saturation=model.multicompartment_config.edema_half_saturation,
-            spontaneous_necrosis_rate=(
-                model.multicompartment_config.spontaneous_necrosis_rate
-            ),
+            spontaneous_necrosis_rate=(model.multicompartment_config.spontaneous_necrosis_rate),
             necrosis_threshold=model.multicompartment_config.necrosis_threshold,
-            necrosis_transition_width=(
-                model.multicompartment_config.necrosis_transition_width
-            ),
+            necrosis_transition_width=(model.multicompartment_config.necrosis_transition_width),
         ),
         spacing=spacing,
         cavity_mask=forward_cavity,
@@ -262,12 +255,13 @@ def run_multicompartment_clinical(
         initial_edema,
         initial_necrotic,
         np.asarray([horizon]),
-        treatment_cell_kill=lambda time: (parameters["treatment_cell_kill_per_day"] or 0.0)
-        * treatment_exposure(time),
+        treatment_cell_kill=lambda time: (
+            (parameters["treatment_cell_kill_per_day"] or 0.0) * treatment_exposure(time)
+        ),
         treatment_edema_leakage_suppression=lambda time: (
-            parameters["antiangiogenic_leakage_suppression"] or 0.0
-        )
-        * edema_treatment_exposure(time),
+            (parameters["antiangiogenic_leakage_suppression"] or 0.0)
+            * edema_treatment_exposure(time)
+        ),
     )
     simulation_seconds = time_module.perf_counter() - simulation_start
     predicted = mri_surrogate_channels(
@@ -314,8 +308,7 @@ def run_multicompartment_clinical(
             initial_edema=initial_edema,
             initial_necrotic=initial_necrotic,
             scenario_disagreement_mask=(
-                (predicted_whole >= config.threshold)
-                != (persistence_whole >= config.threshold)
+                (predicted_whole >= config.threshold) != (persistence_whole >= config.threshold)
             )
             & brain,
         )
@@ -332,9 +325,7 @@ def run_multicompartment_clinical(
             "final_physics": training.physics_loss[-1],
             "final_boundary": training.boundary_loss[-1],
             "final_radiation_jump": training.radiation_jump_loss[-1],
-            **{
-                f"scale_{name}": value for name, value in training.loss_scales.items()
-            },
+            **{f"scale_{name}": value for name, value in training.loss_scales.items()},
         },
         channel_metrics=channel_metrics,
         whole_abnormality_metrics=whole_metrics,
@@ -400,9 +391,7 @@ def _model_parameters(
         "edema_clearance_per_day": float(model.edema_clearance_rate.detach().cpu()),
         "necrosis_clearance_per_day": float(model.necrosis_clearance_rate.detach().cpu()),
         "treatment_cell_kill_per_day": (
-            float(model.treatment_cell_kill_rate.detach().cpu())
-            if cell_kill_identifiable
-            else None
+            float(model.treatment_cell_kill_rate.detach().cpu()) if cell_kill_identifiable else None
         ),
         "antiangiogenic_leakage_suppression": (
             float(model.antiangiogenic_leakage_suppression.detach().cpu())
@@ -412,9 +401,7 @@ def _model_parameters(
     }
 
 
-def _numpy_treatment_exposure(
-    windows: tuple[TreatmentWindow, ...], offset_day: float
-):
+def _numpy_treatment_exposure(windows: tuple[TreatmentWindow, ...], offset_day: float):
     def exposure(elapsed_day: float) -> float:
         day = offset_day + elapsed_day
         total = 0.0
@@ -519,9 +506,7 @@ def _metrics(
         "persistence_dice": persistence_dice,
         "dice_skill_over_persistence": skill,
         "beats_persistence": skill > 0,
-        "volume_relative_error": _masked_volume_error(
-            prediction, target, mask, threshold
-        ),
+        "volume_relative_error": _masked_volume_error(prediction, target, mask, threshold),
     }
 
 

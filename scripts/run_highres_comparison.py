@@ -90,8 +90,9 @@ def main() -> None:
     _show("time-integrated", results["time_integrated"])
     _show("time-blind", results["time_blind"])
     print("=" * 78, flush=True)
-    print("corr>0 tracks tumor biology; corr<0 means the model learned the scan schedule.",
-          flush=True)
+    print(
+        "corr>0 tracks tumor biology; corr<0 means the model learned the scan schedule.", flush=True
+    )
 
 
 if __name__ == "__main__":

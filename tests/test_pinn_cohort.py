@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -108,18 +107,26 @@ def test_summarize_cohort_with_failure():
 def test_resume_logic():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_root = Path(tmpdir)
-        _save_transition_result(output_root, "T1", {
-            "transition_id": "T1",
-            "patient_id": "P1",
-            "status": "success",
-            "forecast_dice": 0.7,
-        })
-        _save_transition_result(output_root, "T2", {
-            "transition_id": "T2",
-            "patient_id": "P2",
-            "status": "failed",
-            "error": "test",
-        })
+        _save_transition_result(
+            output_root,
+            "T1",
+            {
+                "transition_id": "T1",
+                "patient_id": "P1",
+                "status": "success",
+                "forecast_dice": 0.7,
+            },
+        )
+        _save_transition_result(
+            output_root,
+            "T2",
+            {
+                "transition_id": "T2",
+                "patient_id": "P2",
+                "status": "failed",
+                "error": "test",
+            },
+        )
         completed = _load_completed_ids(output_root)
         assert "T1" in completed
         assert "T2" not in completed

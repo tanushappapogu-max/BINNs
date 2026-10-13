@@ -81,8 +81,7 @@ class MultiCompartmentParameters:
         crowding_switch = 0.5 * (
             1.0
             + np.tanh(
-                (viable + necrotic - self.necrosis_threshold)
-                / self.necrosis_transition_width
+                (viable + necrotic - self.necrosis_threshold) / self.necrosis_transition_width
             )
         )
         spontaneous_death = self.spontaneous_necrosis_rate * crowding_switch * viable
@@ -97,8 +96,8 @@ class MultiCompartmentParameters:
             * (1.0 - edema)
         )
         edema_reaction = (
-            (1.0 - edema_suppression) * edema_source - self.edema_clearance_rate * edema
-        )
+            1.0 - edema_suppression
+        ) * edema_source - self.edema_clearance_rate * edema
         return viable_reaction, edema_reaction, necrotic_reaction
 
 

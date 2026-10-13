@@ -155,20 +155,23 @@ Python 3.11 through 3.13 is supported. Python 3.12 is recommended.
 Using `uv`:
 
 ```bash
-uv venv --python 3.12
-uv sync --extra dev --extra ml
+uv sync --extra dev
 ```
+
+The development extra includes the ML and imaging packages exercised by the
+full test suite. `uv` reads the repository's `.python-version` and creates a
+Python 3.12 environment automatically.
 
 Using `pip` in an activated virtual environment:
 
 ```bash
-python -m pip install -e ".[dev,ml]"
+python -m pip install -e ".[dev]"
 ```
 
 The optional `imaging` dependency group installs NIfTI support for the clinical pilot:
 
 ```bash
-uv sync --extra dev --extra ml --extra imaging
+uv sync --extra ml --extra imaging
 ```
 
 ## Running the tests

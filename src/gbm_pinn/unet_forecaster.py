@@ -14,7 +14,6 @@ the persistence baseline and only departs from it through learned dynamics.
 from __future__ import annotations
 
 import json
-import time as time_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ FloatArray = NDArray[np.float64]
 # Parameter network: source scan + treatment -> (D, rho, kappa)
 # ---------------------------------------------------------------------------
 
+
 class ParameterNet(nn.Module):
     """Predicts patient-specific reaction-diffusion parameters.
 
@@ -52,7 +52,10 @@ class ParameterNet(nn.Module):
     D_MAX_RATE, RHO_MAX_RATE, KAPPA_MAX_RATE = 1.5, 4.0, 4.0
 
     def __init__(
-        self, n_treatment: int = 4, base_filters: int = 16, in_channels: int = 1,
+        self,
+        n_treatment: int = 4,
+        base_filters: int = 16,
+        in_channels: int = 1,
         per_year_rates: bool = False,
     ) -> None:
         super().__init__()
@@ -60,7 +63,8 @@ class ParameterNet(nn.Module):
         # Under time scaling the simulator multiplies by the elapsed interval,
         # so the parameters represent per-year rates and need wider bounds.
         self.bounds = (
-            (self.D_MAX_RATE, self.RHO_MAX_RATE, self.KAPPA_MAX_RATE) if per_year_rates
+            (self.D_MAX_RATE, self.RHO_MAX_RATE, self.KAPPA_MAX_RATE)
+            if per_year_rates
             else (self.D_MAX, self.RHO_MAX, self.KAPPA_MAX)
         )
         self.encoder = nn.Sequential(
@@ -87,7 +91,10 @@ class ParameterNet(nn.Module):
         nn.init.constant_(self.head[-1].bias, -4.0)
 
     def forward(
-        self, source: torch.Tensor, treatment: torch.Tensor, horizon: torch.Tensor,
+        self,
+        source: torch.Tensor,
+        treatment: torch.Tensor,
+        horizon: torch.Tensor,
         mri: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoder_input = source if mri is None else torch.cat([source, mri], dim=1)
@@ -141,6 +148,7 @@ class SpatialDiffusivityNet(nn.Module):
 # ---------------------------------------------------------------------------
 # Differentiable Fisher-KPP simulator
 # ---------------------------------------------------------------------------
+
 
 class ReactionDiffusionSimulator(nn.Module):
     """Evolves density via du/dt = D*laplacian(u) + rho*u*(1-u) - kappa*u.
@@ -245,6 +253,7 @@ class ReactionDiffusionSimulator(nn.Module):
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 class TumorTransitionDataset(Dataset):
     """Loads source/target density volumes plus treatment and horizon."""
 
@@ -308,12 +317,18 @@ class TumorTransitionDataset(Dataset):
             source_labels = source_labels[::ds, ::ds, ::ds]
             target_labels = target_labels[::ds, ::ds, ::ds]
 
-        source_density = self._pad(segmentation_to_density(
-            source_labels, infiltrative_density=self.infiltrative_density,
-        ).astype(np.float32))
-        target_density = self._pad(segmentation_to_density(
-            target_labels, infiltrative_density=self.infiltrative_density,
-        ).astype(np.float32))
+        source_density = self._pad(
+            segmentation_to_density(
+                source_labels,
+                infiltrative_density=self.infiltrative_density,
+            ).astype(np.float32)
+        )
+        target_density = self._pad(
+            segmentation_to_density(
+                target_labels,
+                infiltrative_density=self.infiltrative_density,
+            ).astype(np.float32)
+        )
 
         # Label 4 is the resection cavity. It carries zero density, so without
         # an explicit domain it is indistinguishable from brain tissue and the
@@ -322,19 +337,23 @@ class TumorTransitionDataset(Dataset):
 
         horizon_days = float(t["target_day"]) - float(t["source_day"])
         te = t.get("treatment_exposure", {})
-        treatment = np.array([
-            float(te.get("radiation_exposure", 0.0) > 0),
-            float(te.get("systemic_cytotoxic_exposure", 0.0) > 0),
-            float(te.get("antiangiogenic_exposure", 0.0) > 0),
-            float(te.get("device_exposure", 0.0) > 0),
-        ], dtype=np.float32)
+        treatment = np.array(
+            [
+                float(te.get("radiation_exposure", 0.0) > 0),
+                float(te.get("systemic_cytotoxic_exposure", 0.0) > 0),
+                float(te.get("antiangiogenic_exposure", 0.0) > 0),
+                float(te.get("device_exposure", 0.0) > 0),
+            ],
+            dtype=np.float32,
+        )
 
         source_t = torch.from_numpy(source_density[np.newaxis])
         target_t = torch.from_numpy(target_density[np.newaxis])
         domain_t = torch.from_numpy(domain[np.newaxis])
         mri_t = (
             torch.from_numpy(self._load_mri(t["source_segmentation"]))
-            if self.use_mri else torch.empty(0)
+            if self.use_mri
+            else torch.empty(0)
         )
 
         if self.augment:
@@ -360,7 +379,7 @@ class TumorTransitionDataset(Dataset):
     def _pad(self, volume: np.ndarray) -> np.ndarray:
         ts = self.target_shape
         padded = np.zeros(ts, dtype=volume.dtype)
-        slices = tuple(slice(0, min(v, s)) for v, s in zip(volume.shape, ts))
+        slices = tuple(slice(0, min(v, s)) for v, s in zip(volume.shape, ts, strict=True))
         padded[slices] = volume[slices]
         return padded
 
@@ -368,6 +387,7 @@ class TumorTransitionDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Losses
 # ---------------------------------------------------------------------------
+
 
 def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """1 - soft Dice, per-sample and averaged. Directly targets the metric.
@@ -378,7 +398,7 @@ def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) 
     pred_f = pred.flatten(1)
     target_f = target.flatten(1)
     intersection = (pred_f * target_f).sum(dim=1)
-    union = (pred_f ** 2).sum(dim=1) + (target_f ** 2).sum(dim=1)
+    union = (pred_f**2).sum(dim=1) + (target_f**2).sum(dim=1)
     dice = (2.0 * intersection + eps) / (union + eps)
     return 1.0 - dice.mean()
 
@@ -386,6 +406,7 @@ def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TrainConfig:
@@ -443,6 +464,7 @@ def _resolve_device(device: str) -> torch.device:
 # Training & evaluation
 # ---------------------------------------------------------------------------
 
+
 def train(config: TrainConfig) -> dict[str, Any]:
     """Train the parameter network + simulator across the training cohort."""
     torch.manual_seed(config.seed)
@@ -452,10 +474,12 @@ def train(config: TrainConfig) -> dict[str, Any]:
     config.output_root.mkdir(parents=True, exist_ok=True)
 
     train_transitions = load_transition_manifest(
-        config.transition_index_path, required_role="training",
+        config.transition_index_path,
+        required_role="training",
     )
     val_transitions = load_transition_manifest(
-        config.val_transition_index_path, required_role="model_selection",
+        config.val_transition_index_path,
+        required_role="model_selection",
     )
 
     print(f"Training transitions: {len(train_transitions)}", flush=True)
@@ -464,24 +488,34 @@ def train(config: TrainConfig) -> dict[str, Any]:
     print(f"Simulator: {config.n_steps} steps, dt={config.dt}", flush=True)
 
     train_ds = TumorTransitionDataset(
-        train_transitions, config.data_root, downsample=config.downsample,
-        target_shape=config.target_shape, infiltrative_density=config.infiltrative_density,
+        train_transitions,
+        config.data_root,
+        downsample=config.downsample,
+        target_shape=config.target_shape,
+        infiltrative_density=config.infiltrative_density,
         augment=True,
     )
     val_ds = TumorTransitionDataset(
-        val_transitions, config.data_root, downsample=config.downsample,
-        target_shape=config.target_shape, infiltrative_density=config.infiltrative_density,
+        val_transitions,
+        config.data_root,
+        downsample=config.downsample,
+        target_shape=config.target_shape,
+        infiltrative_density=config.infiltrative_density,
         augment=False,
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=config.batch_size, shuffle=True,
-        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
+        train_ds,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=config.num_workers)
 
     param_net = ParameterNet(
-        n_treatment=4, base_filters=config.base_filters,
+        n_treatment=4,
+        base_filters=config.base_filters,
         per_year_rates=config.time_scaled,
     ).to(device)
     simulator = ReactionDiffusionSimulator(n_steps=config.n_steps, dt=config.dt).to(device)
@@ -490,7 +524,9 @@ def train(config: TrainConfig) -> dict[str, Any]:
     print(f"Parameter network: {param_count:,} params", flush=True)
 
     optimizer = torch.optim.AdamW(
-        param_net.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+        param_net.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
@@ -511,7 +547,11 @@ def train(config: TrainConfig) -> dict[str, Any]:
             domain = batch["domain"].to(device) if config.use_cavity_domain else None
             D, rho, kappa = param_net(source, treatment, horizon)
             predicted = simulator(
-                source, D, rho, kappa, domain,
+                source,
+                D,
+                rho,
+                kappa,
+                domain,
                 horizon if config.time_scaled else None,
             )
 
@@ -542,17 +582,22 @@ def train(config: TrainConfig) -> dict[str, Any]:
         val = evaluate(param_net, simulator, val_loader, device, config)
         print(
             f"Epoch {epoch:3d} | loss={avg_loss:.4f} | "
-            f"skill={val['mean_skill']:+.4f} beating={val['n_beating_persistence']}/{val['n_total']} "
+            f"skill={val['mean_skill']:+.4f} "
+            f"beating={val['n_beating_persistence']}/{val['n_total']} "
             f"| growth_dice={val['mean_growth_dice']:.4f} "
             f"| hi_change skill={val.get('high_change_mean_skill', 0):+.4f} "
             f"({val.get('high_change_beating', 0)}/{val.get('high_change_n', 0)})",
             flush=True,
         )
-        history.append({
-            "epoch": epoch, "loss": avg_loss,
-            "val_dice": val["mean_dice"], "val_skill": val["mean_skill"],
-            "val_beating": val["n_beating_persistence"],
-        })
+        history.append(
+            {
+                "epoch": epoch,
+                "loss": avg_loss,
+                "val_dice": val["mean_dice"],
+                "val_skill": val["mean_skill"],
+                "val_beating": val["n_beating_persistence"],
+            }
+        )
 
         if val["mean_skill"] > best_skill:
             best_skill = val["mean_skill"]
@@ -565,10 +610,11 @@ def train(config: TrainConfig) -> dict[str, Any]:
     final["model_parameters"] = param_count
 
     (config.output_root / "results.json").write_text(
-        json.dumps(final, indent=2) + "\n", encoding="utf-8",
+        json.dumps(final, indent=2) + "\n",
+        encoding="utf-8",
     )
 
-    print(f"\nFinal Results:", flush=True)
+    print("\nFinal Results:", flush=True)
     print(f"  Mean Dice: {final['mean_dice']:.4f}", flush=True)
     print(f"  Mean Skill: {final['mean_skill']:+.4f}", flush=True)
     print(f"  Beating Persistence: {final['n_beating_persistence']}/{final['n_total']}", flush=True)
@@ -598,7 +644,11 @@ def evaluate(
             domain = batch["domain"].to(device) if config.use_cavity_domain else None
             D, rho, kappa = param_net(source, treatment, horizon)
             predicted = simulator(
-                source, D, rho, kappa, domain,
+                source,
+                D,
+                rho,
+                kappa,
+                domain,
                 horizon if config.time_scaled else None,
             )
 
@@ -611,7 +661,9 @@ def evaluate(
                 brain_mask = np.ones_like(source_np, dtype=bool)
 
             forecast_dice = float(_masked_dice(pred_np, target_np, brain_mask, config.threshold))
-            persistence_dice = float(_masked_dice(source_np, target_np, brain_mask, config.threshold))
+            persistence_dice = float(
+                _masked_dice(source_np, target_np, brain_mask, config.threshold)
+            )
 
             src_bin = source_np > config.threshold
             tgt_bin = target_np > config.threshold
@@ -634,42 +686,42 @@ def evaluate(
                 return 2.0 * float((a & b).sum()) / denom
 
             union = int((src_bin | tgt_bin).sum())
-            change_fraction = (
-                float((src_bin ^ tgt_bin).sum()) / union if union > 0 else 0.0
-            )
+            change_fraction = float((src_bin ^ tgt_bin).sum()) / union if union > 0 else 0.0
 
             # Tumor burden. Dice asks whether the shape landed in the right
             # place; volume asks how much tumor there will be, which is the
             # quantity followed clinically.
-            ml_per_voxel = (config.downsample ** 3) / 1000.0
+            ml_per_voxel = (config.downsample**3) / 1000.0
             src_vol = float(src_bin.sum()) * ml_per_voxel
             tgt_vol = float(tgt_bin.sum()) * ml_per_voxel
             pred_vol = float(prd_bin.sum()) * ml_per_voxel
             true_change = tgt_vol - src_vol
             pred_change = pred_vol - src_vol
 
-            records.append({
-                "transition_id": batch["transition_id"][0],
-                "patient_id": batch["patient_id"][0],
-                "forecast_dice": forecast_dice,
-                "persistence_dice": persistence_dice,
-                "dice_skill": forecast_dice - persistence_dice,
-                "growth_dice": _dice(growth_pred, growth_true),
-                "shrink_dice": _dice(shrink_pred, shrink_true),
-                "growth_voxels_true": int(growth_true.sum()),
-                "change_fraction": change_fraction,
-                "source_volume_ml": src_vol,
-                "target_volume_ml": tgt_vol,
-                "predicted_volume_ml": pred_vol,
-                "true_volume_change_ml": true_change,
-                "predicted_volume_change_ml": pred_change,
-                "volume_abs_error_ml": abs(pred_change - true_change),
-                "persistence_abs_error_ml": abs(true_change),
-                "horizon_days": float(horizon.item()) * 365.0,
-                "D": float(D.item()),
-                "rho": float(rho.item()),
-                "kappa": float(kappa.item()),
-            })
+            records.append(
+                {
+                    "transition_id": batch["transition_id"][0],
+                    "patient_id": batch["patient_id"][0],
+                    "forecast_dice": forecast_dice,
+                    "persistence_dice": persistence_dice,
+                    "dice_skill": forecast_dice - persistence_dice,
+                    "growth_dice": _dice(growth_pred, growth_true),
+                    "shrink_dice": _dice(shrink_pred, shrink_true),
+                    "growth_voxels_true": int(growth_true.sum()),
+                    "change_fraction": change_fraction,
+                    "source_volume_ml": src_vol,
+                    "target_volume_ml": tgt_vol,
+                    "predicted_volume_ml": pred_vol,
+                    "true_volume_change_ml": true_change,
+                    "predicted_volume_change_ml": pred_change,
+                    "volume_abs_error_ml": abs(pred_change - true_change),
+                    "persistence_abs_error_ml": abs(true_change),
+                    "horizon_days": float(horizon.item()) * 365.0,
+                    "D": float(D.item()),
+                    "rho": float(rho.item()),
+                    "kappa": float(kappa.item()),
+                }
+            )
 
     skills = [r["dice_skill"] for r in records]
     dices = [r["forecast_dice"] for r in records]
@@ -724,17 +776,20 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         # Persistence forecasts zero volume change, so its error is |true|.
         pers_err = np.abs(true_dv)
         moved = true_dv != 0
-        summary.update({
-            "volume_mae_ml": float(model_err.mean()),
-            "persistence_volume_mae_ml": float(pers_err.mean()),
-            "volume_mae_reduction_ml": float(pers_err.mean() - model_err.mean()),
-            "n_volume_better_than_persistence": int((model_err < pers_err).sum()),
-            "direction_accuracy": (
-                float((np.sign(pred_dv[moved]) == np.sign(true_dv[moved])).mean())
-                if moved.any() else 0.0
-            ),
-            "n_direction_scored": int(moved.sum()),
-        })
+        summary.update(
+            {
+                "volume_mae_ml": float(model_err.mean()),
+                "persistence_volume_mae_ml": float(pers_err.mean()),
+                "volume_mae_reduction_ml": float(pers_err.mean() - model_err.mean()),
+                "n_volume_better_than_persistence": int((model_err < pers_err).sum()),
+                "direction_accuracy": (
+                    float((np.sign(pred_dv[moved]) == np.sign(true_dv[moved])).mean())
+                    if moved.any()
+                    else 0.0
+                ),
+                "n_direction_scored": int(moved.sum()),
+            }
+        )
         if len(records) > 2 and true_dv.std() > 0 and pred_dv.std() > 0:
             summary["volume_change_correlation"] = float(np.corrcoef(true_dv, pred_dv)[0, 1])
 
@@ -754,7 +809,7 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         from scipy.stats import wilcoxon
 
         if len(patient_skills) >= 6 and any(s != 0 for s in patient_skills):
-            stat, p = wilcoxon(patient_skills)
+            _, p = wilcoxon(patient_skills)
             summary["wilcoxon_p_patient_clustered"] = float(p)
     except Exception:
         pass
@@ -769,14 +824,11 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             g_skill = [r["dice_skill"] for r in group]
             g_growth = [
-                r["growth_dice"] for r in group
-                if not np.isnan(r.get("growth_dice", float("nan")))
+                r["growth_dice"] for r in group if not np.isnan(r.get("growth_dice", float("nan")))
             ]
             summary[f"{name}_n"] = len(group)
             summary[f"{name}_mean_skill"] = float(np.mean(g_skill))
             summary[f"{name}_beating"] = sum(1 for s in g_skill if s > 0)
-            summary[f"{name}_mean_growth_dice"] = (
-                float(np.mean(g_growth)) if g_growth else 0.0
-            )
+            summary[f"{name}_mean_growth_dice"] = float(np.mean(g_growth)) if g_growth else 0.0
 
     return summary

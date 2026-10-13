@@ -35,9 +35,7 @@ def main() -> None:
     if args.field_warmup_epochs is not None:
         protocol_overrides["field_warmup_epochs"] = args.field_warmup_epochs
     if args.parameter_calibration_epochs is not None:
-        protocol_overrides["parameter_calibration_epochs"] = (
-            args.parameter_calibration_epochs
-        )
+        protocol_overrides["parameter_calibration_epochs"] = args.parameter_calibration_epochs
     if args.observation_count is not None:
         protocol_overrides["observation_count"] = args.observation_count
     if args.forecast_index is not None:

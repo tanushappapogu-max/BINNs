@@ -124,12 +124,15 @@ class MultiCompartmentTrainingConfig:
             raise ValueError("staged phases must leave at least one joint-training epoch")
         if self.network_learning_rate <= 0 or self.parameter_learning_rate <= 0:
             raise ValueError("learning rates must be positive")
-        if min(
-            self.data_weight,
-            self.physics_weight,
-            self.boundary_weight,
-            self.radiation_jump_weight,
-        ) < 0:
+        if (
+            min(
+                self.data_weight,
+                self.physics_weight,
+                self.boundary_weight,
+                self.radiation_jump_weight,
+            )
+            < 0
+        ):
             raise ValueError("loss weights must be nonnegative")
         for value in (
             self.data_batch_size,
@@ -402,9 +405,7 @@ class PiecewiseTimeMultiCompartmentPINN(MultiCompartmentPINN):
 
     def _interval_fields(self, interval_index: int, coordinates: Tensor) -> Tensor:
         network = (
-            self.network
-            if interval_index == 0
-            else self.post_event_networks[interval_index - 1]
+            self.network if interval_index == 0 else self.post_event_networks[interval_index - 1]
         )
         unit_fields = torch.sigmoid(network(self.coordinate_features(coordinates)))
         scale = torch.tensor(
@@ -444,8 +445,7 @@ def multicompartment_pde_residual(model: MultiCompartmentPINN, coordinates: Tens
     viable, edema, necrotic = fields.split(1, dim=1)
     cell_kill = model.treatment_cell_kill_rate * model.cell_kill_exposure_at(coordinates)
     edema_suppression = (
-        model.antiangiogenic_leakage_suppression
-        * model.edema_treatment_exposure_at(coordinates)
+        model.antiangiogenic_leakage_suppression * model.edema_treatment_exposure_at(coordinates)
     )
     occupied = (viable + necrotic) / model.config.carrying_capacity
     proliferation = model.proliferation_rate * viable * (1.0 - occupied)
@@ -467,9 +467,7 @@ def multicompartment_pde_residual(model: MultiCompartmentPINN, coordinates: Tens
         / (viable + model.multicompartment_config.edema_half_saturation)
         * (1.0 - edema)
     )
-    edema_reaction = (
-        (1.0 - edema_suppression) * edema_source - model.edema_clearance_rate * edema
-    )
+    edema_reaction = (1.0 - edema_suppression) * edema_source - model.edema_clearance_rate * edema
     necrotic_reaction = (
         spontaneous_death + treatment_death - model.necrosis_clearance_rate * necrotic
     )
@@ -667,10 +665,7 @@ def fit_multicompartment_pinn(
             )
 
         scaled_loss_terms = (
-            {
-                name: value / loss_scales[name]
-                for name, value in raw_loss_terms.items()
-            }
+            {name: value / loss_scales[name] for name, value in raw_loss_terms.items()}
             if config.normalize_loss_terms
             else raw_loss_terms
         )
@@ -716,10 +711,7 @@ def fit_multicompartment_pinn(
         boundary_loss=tuple(histories["boundary"]),
         radiation_jump_loss=tuple(histories["radiation_jump"]),
         loss_scales=loss_scales
-        or {
-            name: 1.0
-            for name in ("data", "physics", "boundary", "radiation_jump")
-        },
+        or {name: 1.0 for name in ("data", "physics", "boundary", "radiation_jump")},
     )
 
 
@@ -742,9 +734,9 @@ def segmentation_to_observation_channels(
     viable_proxy = np.zeros(labels.shape, dtype=np.float32)
     viable_proxy[labels == 2] = infiltrative_viable_density
     viable_proxy[labels == 3] = 1.0
-    return np.stack(
-        (viable_proxy, np.isin(labels, (2, 3)), labels == 1), axis=-1
-    ).astype(np.float32)
+    return np.stack((viable_proxy, np.isin(labels, (2, 3)), labels == 1), axis=-1).astype(
+        np.float32
+    )
 
 
 def censored_observation_loss(

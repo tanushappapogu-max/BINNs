@@ -130,10 +130,7 @@ class MultiCompartmentSolver:
             not np.isfinite(maximum_time_step) or maximum_time_step <= 0
         ):
             raise ValueError("maximum_time_step must be finite and positive")
-        if any(
-            later.time < earlier.time
-            for earlier, later in pairwise(radiation_fractions)
-        ):
+        if any(later.time < earlier.time for earlier, later in pairwise(radiation_fractions)):
             raise ValueError("radiation fractions must be ordered by time")
 
         viable = self._validated_state(initial_viable, "initial_viable")
@@ -160,9 +157,7 @@ class MultiCompartmentSolver:
                 next_fraction += 1
             while current_time < target_time:
                 cell_kill = self._rate_at(treatment_cell_kill, current_time)
-                edema_suppression = self._rate_at(
-                    treatment_edema_leakage_suppression, current_time
-                )
+                edema_suppression = self._rate_at(treatment_edema_leakage_suppression, current_time)
                 stable_step = self.stable_time_step(
                     float(np.max(cell_kill, initial=0.0)),
                     float(np.max(edema_suppression, initial=0.0)),

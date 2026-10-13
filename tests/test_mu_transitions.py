@@ -67,14 +67,10 @@ def test_transition_index_defaults_to_training_patients(tmp_path) -> None:
     assert result["transition_count"] == 2
     assert {item["patient_id"] for item in result["transitions"]} == {"P-train"}
     assert result["transitions"][1]["horizon_days"] == 15
-    assert (
-        result["transitions"][0]["treatment_exposure"]["systemic_cytotoxic_exposure"]
-        == 0.5
-    )
-    assert (
-        result["transitions"][1]["treatment_exposure"]["systemic_cytotoxic_exposure"]
-        == pytest.approx(10 / 15)
-    )
+    assert result["transitions"][0]["treatment_exposure"]["systemic_cytotoxic_exposure"] == 0.5
+    assert result["transitions"][1]["treatment_exposure"][
+        "systemic_cytotoxic_exposure"
+    ] == pytest.approx(10 / 15)
     assert result["transitions"][0]["source_morphology"]["enhancing_volume_ml"] > 0
     assert result["transitions"][0]["history_available"] is False
     assert result["transitions"][1]["history_available"] is True

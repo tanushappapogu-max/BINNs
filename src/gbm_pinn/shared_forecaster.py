@@ -76,9 +76,7 @@ def load_transition_manifest(path: Path, *, required_role: str) -> list[dict[str
     return transitions
 
 
-def prepare_transition(
-    transition: dict[str, Any], *, downsample: int = 4
-) -> PreparedTransition:
+def prepare_transition(transition: dict[str, Any], *, downsample: int = 4) -> PreparedTransition:
     """Construct source-only voxel features and a separate future target."""
     if downsample <= 0:
         raise ValueError("downsample must be positive")
@@ -92,9 +90,9 @@ def prepare_transition(
     target = np.rint(np.asanyarray(target_image.dataobj)[::downsample, ::downsample, ::downsample])
     if source.shape != target.shape or not np.allclose(source_image.affine, target_image.affine):
         raise ValueError("source and target segmentations must be aligned")
-    if not set(np.unique(source)).issubset({0, 1, 2, 3, 4}) or not set(
-        np.unique(target)
-    ).issubset({0, 1, 2, 3, 4}):
+    if not set(np.unique(source)).issubset({0, 1, 2, 3, 4}) or not set(np.unique(target)).issubset(
+        {0, 1, 2, 3, 4}
+    ):
         raise ValueError("MU labels must lie between 0 and 4")
     source_abnormality = np.isin(source, (1, 2, 3))
     target_abnormality = np.isin(target, (1, 2, 3))
@@ -125,13 +123,10 @@ def prepare_transition(
     distance_velocity = (signed_distance - previous_distance) / history_days
     grid = np.indices(source.shape, dtype=np.float32)
     coordinates = [
-        2.0 * grid[axis].reshape(-1) / max(source.shape[axis] - 1, 1) - 1.0
-        for axis in range(3)
+        2.0 * grid[axis].reshape(-1) / max(source.shape[axis] - 1, 1) - 1.0 for axis in range(3)
     ]
     one_hot = [(source.reshape(-1) == label).astype(np.float32) for label in range(1, 5)]
-    previous_one_hot = [
-        (previous.reshape(-1) == label).astype(np.float32) for label in range(1, 5)
-    ]
+    previous_one_hot = [(previous.reshape(-1) == label).astype(np.float32) for label in range(1, 5)]
     horizon = np.full(source.size, np.log1p(float(transition["horizon_days"])), np.float32)
     exposure = transition["treatment_exposure"]
     treatments = [

@@ -71,16 +71,14 @@ class BINN(nn.Module):
     def pde_residual(self, xt_physical: torch.Tensor) -> torch.Tensor:
         """Residual u_t - d/dx(D(u) u_x) - R(u) at physical coordinates."""
         coords = xt_physical.detach().clone().requires_grad_(True)
-        xt_n = torch.stack(
-            [coords[:, 0] / self.x_scale, coords[:, 1] / self.t_scale], dim=1
-        )
+        xt_n = torch.stack([coords[:, 0] / self.x_scale, coords[:, 1] / self.t_scale], dim=1)
         u = self.solution(xt_n)
         grad = torch.autograd.grad(u, coords, torch.ones_like(u), create_graph=True)[0]
         u_x, u_t = grad[:, 0:1], grad[:, 1:2]
         flux = self.diffusivity(u) * u_x
-        dflux_dx = torch.autograd.grad(
-            flux, coords, torch.ones_like(flux), create_graph=True
-        )[0][:, 0:1]
+        dflux_dx = torch.autograd.grad(flux, coords, torch.ones_like(flux), create_graph=True)[0][
+            :, 0:1
+        ]
         return u_t - dflux_dx - self.growth(u)
 
 
@@ -185,8 +183,14 @@ def solution_r2(model: BINN, coords: FloatArray, clean_values: FloatArray) -> fl
 
 
 def simulate_reaction_diffusion(
-    diffusivity, growth, *, length: float = 10.0, n_x: int = 200,
-    duration: float = 6.0, n_t: int = 6000, n_snapshots: int = 10,
+    diffusivity,
+    growth,
+    *,
+    length: float = 10.0,
+    n_x: int = 200,
+    duration: float = 6.0,
+    n_t: int = 6000,
+    n_snapshots: int = 10,
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
     """Explicit finite-difference reference solver on a no-flux domain.
 
