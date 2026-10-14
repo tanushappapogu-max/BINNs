@@ -13,6 +13,9 @@ dependencies = [
   "scipy>=1.12,<2",
 ]
 
+[project.scripts]
+gbm-ceiling = "gbm_pinn.ceiling_cli:main"
+
 [project.optional-dependencies]
 dev = [
   "nibabel>=5.3,<6",

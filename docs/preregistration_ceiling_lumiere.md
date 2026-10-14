@@ -116,3 +116,18 @@ Secondary analyses (not decisive): surgery splits only gives the same verdicts
 (clock p = 1e-5, ceiling 0.066). Whole abnormality shows no clock (p = 0.15) but
 that test had power 0.02, and over half of its change reverts (reverting share
 0.54), consistent with edema fluctuating independently of tumor growth.
+
+## Sensitivity: duplicated sessions in LUMIERE's rating table
+
+Found 2026-10-14 after the run. LUMIERE's expert-rating CSV lists three
+sessions twice (Patient-010 week-001, Patient-042 week-010 rated SD and PD,
+Patient-043 week-106 rated Post-Op and PD), so the merged session table had
+602 rows for 599 sessions. In the confirmatory run each duplicate sat at a
+zero-day gap, which the 28-day rule split; no pair was double counted.
+
+Re-running the identical pre-registered analysis on the deduplicated table
+(`outputs/surveillance/dedup_sensitivity/`) leaves **every verdict unchanged**:
+primary history ceiling 0.049 [0.006, 0.112]; oracle 0.241; clock p = 7e-5
+(power 0.80); patient-rate p = 0.50 (minimum detectable 10 mm/yr); reverting
+p = 0.005. The confirmatory verdicts stand as run. The extractor now
+deduplicates sessions at source (`scripts/prepare_lumiere_volumes.py`).
