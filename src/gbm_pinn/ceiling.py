@@ -59,6 +59,9 @@ class Transitions:
     """Per-transition forecast errors under a fitted model."""
 
     horizon: FloatArray
+    predicted_mean: FloatArray
+    target: FloatArray
+    previous: FloatArray
     persistence_sq: FloatArray
     kalman_sq: FloatArray
     kalman_var: FloatArray
@@ -104,6 +107,9 @@ def kalman(cohort: Cohort, params: StateSpace) -> tuple[float, Transitions]:
 
         index = np.flatnonzero(observed)
         columns["horizon"].append(h[index])
+        columns["predicted_mean"].append(mean_pred[index, 0])
+        columns["target"].append(y[index, k])
+        columns["previous"].append(y[index, k - 1])
         columns["persistence_sq"].append((y[index, k] - y[index, k - 1]) ** 2)
         columns["kalman_sq"].append(innovation[index] ** 2)
         columns["kalman_var"].append(variance[index])

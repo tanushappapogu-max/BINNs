@@ -84,3 +84,35 @@ persistence's error.** Confirmed if the oracle ceiling is below 0.50.
 Relating the reverting component to RANO ratings (for example, whether large
 excursions that revert coincide with PD followed by SD or PR, the pattern of
 pseudoprogression) will be reported as exploratory.
+
+## Outcome
+
+Run 2026-10-14 after the protocol was committed (b30bc34). Results in
+`outputs/surveillance/ceiling_lumiere.json`; verdicts applied mechanically by
+`scripts/judge_lumiere_predictions.py` (`outputs/surveillance/lumiere_verdicts.json`).
+Primary analysis: enhancing radius, 75 segments, 61 patients, 312 transitions.
+
+| Prediction | Verdict | Result |
+|---|---|---|
+| P1 history ceiling ≤ 0.10 | **strongly confirmed** | 0.049 [−0.003, 0.114] |
+| P2 reverting change present | **confirmed** | p = 0.006 |
+| P3 no clock | **falsified** | clock needed, p = 3.4e-5; test power 0.82 |
+| P4 no patient-specific rates | **confirmed** | p = 0.50; minimum detectable drift SD 10 mm/yr |
+| P5 oracle ceiling < 0.50 | **confirmed** | 0.233 [0.012, 0.380] |
+
+Fitted primary model: reverting SD 2.5 mm [0, 3.7]; interval-independent
+lasting change SD 0.0 mm [0, 3.2]; clock-like lasting change SD 4.0 mm per
+√90 days [2.3, 5.2]; common drift 3.5 mm/yr [2.0, 4.9]; between-patient drift
+SD at the floor.
+
+Reading, stated plainly: in LUMIERE, lasting change does accumulate with
+elapsed time (P3 falsified), but as diffusion-like variation whose direction
+is not predictable, around a slow common drift with no measurable
+between-patient differences in steady rate. That is why the forecastability
+ceiling stays low (P1) even though a clock is present. The MU hint of "no
+clock" does not generalize; MU's clock test had power 0.60.
+
+Secondary analyses (not decisive): surgery splits only gives the same verdicts
+(clock p = 1e-5, ceiling 0.066). Whole abnormality shows no clock (p = 0.15) but
+that test had power 0.02, and over half of its change reverts (reverting share
+0.54), consistent with edema fluctuating independently of tumor growth.
